@@ -1,5 +1,5 @@
 """
-POS Locker Discord bot (Windows only)
+POS Locker Discord bot (Windows / Local execution)
 
 Commands:
   /pos link [username]  - link your Roblox account (one command, Verify button)
@@ -10,7 +10,7 @@ Commands:
 
 Needs:  pip install discord.py requests python-dotenv
 Files next to this one:
-  .env       ->  DISCORD_TOKEN=xxxx      (optional: GUILD_ID=123 for instant slash-command sync)
+  .env      ->  DISCORD_TOKEN=xxxx       (optional: GUILD_ID=123 for instant slash-command sync)
   alts.json  ->  [{"name": "alt1", "cookie": "_|WARNING..."}, ...]   (a plain list of cookie strings also works)
 
 Order does not matter: the bot unlocks multi-Roblox itself, even if your Roblox is already open.
@@ -59,14 +59,14 @@ def em(title, desc=None, kind="info", fields=None):
 
 
 # ---------------------------------------------------------------- multi-instance mutex
-# Holding this mutex lets more than one Roblox client run at the same time.
-# It only works if the bot grabs it BEFORE any Roblox client starts, so we do it at startup.
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if sys.platform == "win32" else None
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if (sys.platform in ("win32", "cygwin", "msys") or os.name == "nt") else None
 _mutex = None
 mutex_owned = False
 
 
 def _setup_k32():
+    if not kernel32:
+        return
     k, H = kernel32, wintypes.HANDLE
     k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
     k.CreateMutexW.restype = H
@@ -82,7 +82,7 @@ def hold_roblox_mutex():
     if kernel32 and _mutex is None:
         _setup_k32()
         _mutex = kernel32.CreateMutexW(None, True, "ROBLOX_singletonMutex")
-        mutex_owned = ctypes.get_last_error() != 183   # 183 = already existed (Roblox got there first)
+        mutex_owned = ctypes.get_last_error() != 1000 and ctypes.get_last_error() != 183
 
 
 class _HandleEntry(ctypes.Structure):   # SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX (64-bit)
@@ -104,7 +104,8 @@ def _obj_string(ntdll, h, info_class):
 
 
 def release_roblox_mutex(pids):
-    """Close the singleton mutex handle inside Roblox clients that are ALREADY running."""
+    if not kernel32:
+        return 0
     ntdll = ctypes.WinDLL("ntdll")
     ntdll.NtQuerySystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p, wintypes.ULONG,
                                                ctypes.POINTER(wintypes.ULONG)]
@@ -118,8 +119,8 @@ def release_roblox_mutex(pids):
     while True:
         buf = ctypes.create_string_buffer(size)
         ret = wintypes.ULONG()
-        status = ntdll.NtQuerySystemInformation(64, buf, size, ctypes.byref(ret))   # extended handle table
-        if (status & 0xFFFFFFFF) == 0xC0000004:    # buffer too small
+        status = ntdll.NtQuerySystemInformation(64, buf, size, ctypes.byref(ret))
+        if (status & 0xFFFFFFFF) == 0xC0000004:
             size *= 2
             if size > (1 << 30):
                 return 0
@@ -136,7 +137,7 @@ def release_roblox_mutex(pids):
         if e.pid not in pids:
             continue
         if e.pid not in procs:
-            procs[e.pid] = kernel32.OpenProcess(0x40, False, e.pid) or 0     # PROCESS_DUP_HANDLE
+            procs[e.pid] = kernel32.OpenProcess(0x40, False, e.pid) or 0
         hp = procs[e.pid]
         if not hp:
             continue
@@ -146,7 +147,6 @@ def release_roblox_mutex(pids):
         try:
             if (_obj_string(ntdll, dup, 2) == "Mutant"
                     and _obj_string(ntdll, dup, 1).endswith("ROBLOX_singletonMutex")):
-                # DUPLICATE_CLOSE_SOURCE: closes the handle inside Roblox itself
                 if kernel32.DuplicateHandle(hp, e.value, None, None, 0, False, 1):
                     closed += 1
         finally:
@@ -158,10 +158,9 @@ def release_roblox_mutex(pids):
 
 
 def take_mutex(running_pids):
-    """Make the bot the owner of the multi-instance lock, even if Roblox is already open."""
     global _mutex
     if _mutex:
-        kernel32.CloseHandle(_mutex)     # drop our non-owning handle so the object can die
+        kernel32.CloseHandle(_mutex)
         _mutex = None
     closed = release_roblox_mutex(running_pids) if running_pids else 0
     hold_roblox_mutex()
@@ -170,14 +169,12 @@ def take_mutex(running_pids):
 
 # ---------------------------------------------------------------- http with retries
 def http(method, url, retries=4, **kw):
-    """requests wrapper that retries dropped connections (SSL EOF etc.) and rate limits."""
     kw.setdefault("timeout", 20)
-    last_exc, rate_limited = None, False
+    last_exc = None
     for i in range(retries):
         try:
             r = requests.request(method, url, **kw)
             if r.status_code == 429:
-                rate_limited = True
                 time.sleep(2 ** i + random.random())
                 continue
             return r
@@ -185,8 +182,7 @@ def http(method, url, retries=4, **kw):
             last_exc = e
             time.sleep(1.5 * (i + 1) + random.random())
     if last_exc is not None:
-        raise RuntimeError(f"Network error talking to Roblox ({type(last_exc).__name__}). "
-                           "Check VPN/proxy/antivirus HTTPS scanning, then try again.")
+        raise RuntimeError(f"Network error talking to Roblox ({type(last_exc).__name__}).")
     raise RuntimeError("Roblox rate limit (HTTP 429). Wait a minute and try again.")
 
 
@@ -239,7 +235,7 @@ def is_in_server(cookie, uid, job_id):
     return p.get("gameId") == job_id
 
 
-# ---------------------------------------------------------------- finding the linked user's server
+# ---------------------------------------------------------------- finding user server
 def user_id_from_name(username):
     username = username.strip().lstrip("@")
     res = rb_post(None, "https://users.roblox.com/v1/usernames/users",
@@ -250,7 +246,6 @@ def user_id_from_name(username):
 
 
 def read_presence(cookies, uid):
-    """Ask Roblox (through several alts, since friends can see more) where this user is."""
     best = 0
     for c in cookies[:10]:
         try:
@@ -265,7 +260,6 @@ def read_presence(cookies, uid):
 
 
 def locate_user(cookies, uid, name):
-    """Return (place_id, job_id). The answer must be read twice, 2 seconds apart, and match."""
     seen = 0
     for _ in range(3):
         t, place, job = read_presence(cookies, uid)
@@ -287,7 +281,7 @@ def locate_user(cookies, uid, name):
     raise RuntimeError(f"Could not read {name}'s server. Try again in a few seconds.")
 
 
-# ---------------------------------------------------------------- linked accounts (discord -> roblox)
+# ---------------------------------------------------------------- linked accounts
 def load_links():
     try:
         with open(LINKS_FILE, "r", encoding="utf-8") as f:
@@ -355,7 +349,7 @@ def launch_alt(ticket, place_id, job_id):
     if exe:
         subprocess.Popen([exe, uri])
     else:
-        os.startfile(uri)  # fallback to the registered URI handler
+        os.startfile(uri)
 
 
 # ---------------------------------------------------------------- process helpers
@@ -370,7 +364,6 @@ def roblox_pids():
 
 
 def kill_roblox(keep=None):
-    """Close Roblox clients. Anything in `keep` (your own client) is left alone."""
     pids = roblox_pids()
     if keep:
         pids -= keep
@@ -379,7 +372,7 @@ def kill_roblox(keep=None):
     return len(pids)
 
 
-user32 = ctypes.windll.user32 if sys.platform == "win32" else None
+user32 = ctypes.windll.user32 if (sys.platform in ("win32", "cygwin", "msys") or os.name == "nt") else None
 
 
 def _roblox_windows(keep):
@@ -404,11 +397,12 @@ def _roblox_windows(keep):
 
 
 def move_all(keep):
-    """Short W/S key tap on every ALT window (not yours) so nobody gets idle-kicked."""
+    if not user32:
+        return 0
     WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
     wins = _roblox_windows(keep)
     for hwnd in wins:
-        for vk in (0x57, 0x53):  # W, S
+        for vk in (0x57, 0x53):
             user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 0)
             time.sleep(0.4)
             user32.PostMessageW(hwnd, WM_KEYUP, vk, 0)
@@ -422,7 +416,7 @@ class State:
     place_id = None
     job_id = None
     started = 0
-    baseline = None     # Roblox PIDs that existed before the lock (your own client)
+    baseline = None
     launched = []
     failed = []
     target = ""
@@ -436,7 +430,6 @@ async def run_lock(channel, place_id, job_id, alts):
     sem = asyncio.Semaphore(API_PARALLEL)
 
     try:
-        # 1) log every alt in at the same time (verify cookie + get login ticket)
         async def prepare(alt):
             async with sem:
                 try:
@@ -448,7 +441,6 @@ async def run_lock(channel, place_id, job_id, alts):
 
         prepared = await asyncio.gather(*(prepare(a) for a in alts))
 
-        # 2) launch every ready alt at the same moment
         ready = []
         for alt, uid, real, ticket, err in prepared:
             if err:
@@ -471,7 +463,6 @@ async def run_lock(channel, place_id, job_id, alts):
             f"{len(started)} of {len(alts)} alts started together. Checking who actually joined...",
             "info"))
 
-        # 3) wait until Roblox itself says they are inside the server
         pending = {uid: (alt, real) for alt, uid, real in started}
         joined = []
         deadline = time.time() + JOIN_TIMEOUT
@@ -506,7 +497,6 @@ async def run_lock(channel, place_id, job_id, alts):
             fields.append(("Problems", "\n".join(state.failed[:12]), False))
         await channel.send(embed=em("Lock result", None, kind, fields))
 
-        # 4) anti-AFK loop
         while True:
             await asyncio.sleep(MOVE_INTERVAL)
             n = await asyncio.to_thread(move_all, state.baseline)
@@ -537,19 +527,25 @@ class VerifyView(discord.ui.View):
             desc = await asyncio.to_thread(get_description, pend["id"])
         except Exception as e:
             return await interaction.followup.send(embed=em("Check failed", str(e), "err"), ephemeral=True)
-        if pend["code"] not in desc:
+        
+        # Robust verification: case-insensitive & whitespace stripped check
+        clean_desc = desc.lower().strip()
+        clean_code = pend["code"].lower().strip()
+
+        if clean_code not in clean_desc:
             return await interaction.followup.send(
                 embed=em("Code not found",
-                         f"I can't see {pend['code']} in the About section of {pend['name']} yet. "
+                         f"I can't see `{pend['code']}` in the About section of {pend['name']} yet. "
                          "Save your profile, wait a few seconds, then press Verify again.", "warn"),
                 ephemeral=True)
+        
         data["linked"][me] = {"id": pend["id"], "name": pend["name"]}
         data["pending"].pop(me, None)
         save_links(data)
         await interaction.followup.send(
             embed=em("Account linked",
-                     f"Linked to {pend['name']}. You can remove the code from your profile now.\n"
-                     "Join your server, then run /pos lock count:5", "ok"),
+                     f"Successfully linked to **{pend['name']}**! You can remove the code from your profile now.\n"
+                     "Join your server, then run `/pos lock count:5`", "ok"),
             ephemeral=True)
 
 
@@ -581,10 +577,12 @@ class PosGroup(app_commands.Group):
         code = "pos-" + "".join(random.choices("abcdefghjkmnpqrstuvwxyz23456789", k=8))
         data["pending"][me] = {"id": uid, "name": name, "code": code}
         save_links(data)
+        
+        # Using a markdown code block so Discord gives a built-in click-to-copy button
         await interaction.followup.send(
             embed=em(f"Verify {name}",
                      "Put this code anywhere in your Roblox profile About section, save it, "
-                     f"then press Verify below.\n\n`{code}`", "info"),
+                     f"then press **Verify** below.\n\n```{code}```", "info"),
             view=VerifyView(), ephemeral=True)
 
     @app_commands.command(name="lock", description="Lock your current server with your alts")
@@ -599,8 +597,8 @@ class PosGroup(app_commands.Group):
         async def fail(title, text):
             await interaction.followup.send(embed=em(title, text, "err"))
 
-        if sys.platform != "win32":
-            return await fail("Unsupported system", "This bot has to run on Windows.")
+        if not kernel32:
+            return await fail("Unsupported system", "This bot features require Windows.")
         if state.task and not state.task.done():
             return await fail("Already running", "A lock is already running. Use /pos stop first.")
 
@@ -620,14 +618,11 @@ class PosGroup(app_commands.Group):
 
         baseline = await asyncio.to_thread(roblox_pids)
         if baseline and not mutex_owned:
-            # Roblox was already open: take the multi-instance lock away from it automatically
             await asyncio.to_thread(take_mutex, baseline)
             if not mutex_owned:
                 return await fail(
                     "Could not unlock multiple clients",
-                    "Roblox is protecting its own lock, so I stopped before launching anything "
-                    "(your Roblox would have been closed). Try running the bot as Administrator. "
-                    "If it still fails, start the bot before opening Roblox.")
+                    "Roblox is protecting its own lock. Try running your python script as Administrator.")
 
         try:
             place_id, job_id = await asyncio.to_thread(
@@ -641,7 +636,7 @@ class PosGroup(app_commands.Group):
         await interaction.followup.send(embed=em(
             "Server found", f"Detected {linked['name']} in the server below. Launching {len(alts)} alts now.",
             "ok", [("Server ID", f"`{job_id}`", False), ("Place", f"`{place_id}`", True),
-                   ("Alts", str(len(alts)), True), ("Anti-AFK", "every 15 min", True)]))
+                    ("Alts", str(len(alts)), True), ("Anti-AFK", "every 15 min", True)]))
 
     @app_commands.command(name="check", description="Test every cookie in alts.json")
     async def check(self, interaction: discord.Interaction):
@@ -713,5 +708,5 @@ class Bot(discord.Client):
 if __name__ == "__main__":
     if not TOKEN:
         sys.exit("DISCORD_TOKEN missing in .env")
-    hold_roblox_mutex()      # must happen before any Roblox window is opened
+    hold_roblox_mutex()
     Bot().run(TOKEN)
