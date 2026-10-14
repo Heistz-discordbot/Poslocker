@@ -607,8 +607,7 @@ class PosGroup(app_commands.Group):
             await interaction.followup.send(embed=em(title, text, "err"))
 
         if not kernel32:
-    return await fail("Unsupported system",
-                      f"This copy is running on `{sys.platform}` from `{sys.executable}`. It must run on Windows.")
+            return await fail("Unsupported system", f"This copy is running on `{sys.platform}` from `{sys.executable}`. It must run on Windows.")
         if state.task and not state.task.done():
             return await fail("Already running", "A lock is already running. Use /pos stop first.")
 
@@ -712,8 +711,8 @@ class Bot(discord.Client):
 
     async def on_ready(self):
         print(f"Logged in as {self.user}")
-      print("Running on:", sys.platform, "|", sys.executable)
-print("Multi-Roblox mutex:", "OWNED" if mutex_owned else "NOT owned yet (will be taken automatically on /pos lock)")
+        print("Running on:", sys.platform, "|", sys.executable)
+        print("Multi-Roblox mutex:", "OWNED" if mutex_owned else "NOT owned yet (will be taken automatically on /pos lock)")
 
 
 if __name__ == "__main__":
