@@ -574,7 +574,8 @@ class PosGroup(app_commands.Group):
         except Exception as e:
             return await interaction.followup.send(embed=em("Link failed", str(e), "err"), ephemeral=True)
 
-        code = "pos-" + "".join(random.choices("abcdefghjkmnpqrstuvwxyz23456789", k=8))
+        # Using 'rbx-' prefix so Roblox chat/bio filters NEVER hashtag/censor the code
+        code = "rbx-" + "".join(random.choices("abcdefghjkmnpqrstuvwxyz23456789", k=8))
         data["pending"][me] = {"id": uid, "name": name, "code": code}
         save_links(data)
         
