@@ -47,6 +47,13 @@ PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
 BASE = os.path.dirname(os.path.abspath(__file__))
 LINKS_FILE = os.path.join(BASE, "links.json")
 
+# Word list for un-censorable verification codes on Roblox
+VERIFY_WORDS = [
+    "apple", "banana", "cherry", "dragon", "eagle", "falcon", "forest", "galaxy",
+    "hammer", "island", "jungle", "knight", "lemon", "mango", "ninja", "orange",
+    "planet", "quantum", "rocket", "shadow", "tiger", "umbrella", "violet", "wizard"
+]
+
 # ---------------------------------------------------------------- embeds
 COLORS = {"info": 0x5865F2, "ok": 0x2ECC71, "warn": 0xF1C40F, "err": 0xE74C3C}
 
@@ -528,7 +535,7 @@ class VerifyView(discord.ui.View):
         except Exception as e:
             return await interaction.followup.send(embed=em("Check failed", str(e), "err"), ephemeral=True)
         
-        # Robust verification: case-insensitive & whitespace stripped check
+        # Check if the simple phrase exists in the profile bio
         clean_desc = desc.lower().strip()
         clean_code = pend["code"].lower().strip()
 
@@ -544,7 +551,7 @@ class VerifyView(discord.ui.View):
         save_links(data)
         await interaction.followup.send(
             embed=em("Account linked",
-                     f"Successfully linked to **{pend['name']}**! You can remove the code from your profile now.\n"
+                     f"Successfully linked to **{pend['name']}**! You can remove the phrase from your profile now.\n"
                      "Join your server, then run `/pos lock count:5`", "ok"),
             ephemeral=True)
 
@@ -574,15 +581,16 @@ class PosGroup(app_commands.Group):
         except Exception as e:
             return await interaction.followup.send(embed=em("Link failed", str(e), "err"), ephemeral=True)
 
-        # Using 'rbx-' prefix so Roblox chat/bio filters NEVER hashtag/censor the code
-        code = "rbx-" + "".join(random.choices("abcdefghjkmnpqrstuvwxyz23456789", k=8))
+        # Generate a 3-word English phrase that Roblox's filter will NEVER block
+        w1, w2 = random.sample(VERIFY_WORDS, 2)
+        code = f"verify {w1} {w2}"
         data["pending"][me] = {"id": uid, "name": name, "code": code}
         save_links(data)
         
-        # Using a markdown code block so Discord gives a built-in click-to-copy button
+        # Clickable code block for instant copying
         await interaction.followup.send(
             embed=em(f"Verify {name}",
-                     "Put this code anywhere in your Roblox profile About section, save it, "
+                     "Put this exact phrase anywhere in your Roblox profile About section, save it, "
                      f"then press **Verify** below.\n\n```{code}```", "info"),
             view=VerifyView(), ephemeral=True)
 
