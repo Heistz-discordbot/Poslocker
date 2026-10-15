@@ -12,12 +12,14 @@ Commands:
 Needs:  pip install discord.py requests python-dotenv
 Files next to this one:
   .env      ->  DISCORD_TOKEN=xxxx
-                (optional) GUILD_ID, ROBLOX_EXE, MOVE_INTERVAL_MIN, MOVE_MODE, LAUNCH_DELAY
+                (optional) GUILD_ID, ROBLOX_EXE, MOVE_INTERVAL_MIN, MOVE_MODE, LAUNCH_DELAY,
+                CLOSE_HOST_ROBLOX=1
   alts.json ->  [{"name": "alt1", "cookie": "_|WARNING..."}, {"name": "alt2", "cookie": "..."}]
   links.json -> (auto-generated)
 
-IMPORTANT: this must run on a Windows PC that has Roblox (the normal player from
-roblox.com, not the Microsoft Store version) installed. It will NOT work on a Linux host.
+Run this on a Windows PC with the normal Roblox player (roblox.com, not the Microsoft
+Store version). Players use /pos lock from their OWN devices, after they are already in
+the server. The bot PC itself should not have its own Roblox open.
 """
 
 import asyncio
@@ -46,6 +48,7 @@ MOVE_INTERVAL = float(os.getenv("MOVE_INTERVAL_MIN", "15")) * 60   # seconds bet
 LAUNCH_DELAY = float(os.getenv("LAUNCH_DELAY", "8"))               # seconds between launching each alt
 WINDOW_WAIT = 120                                                  # seconds to wait for a client window
 MOVE_MODE = os.getenv("MOVE_MODE", "focus").lower()                # "focus" (reliable) or "post" (silent, less reliable)
+CLOSE_HOST_ROBLOX = os.getenv("CLOSE_HOST_ROBLOX", "0") == "1"     # auto-close stray Roblox on the bot PC before locking
 MAX_RESTARTS = 3                                                   # auto-relaunch tries per alt
 MONITOR_TICK = 15                                                  # seconds between health checks
 
@@ -65,7 +68,7 @@ if IS_WINDOWS:
     import ctypes
     from ctypes import wintypes
     user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 def em(title, desc=None, kind="info", fields=None):
@@ -211,18 +214,55 @@ def get_description(uid):
 
 
 # ---------------------------------------------------------------- Roblox client launching (Windows)
-_mutex_handles = []
+_mutex_handle = None
+_event_handle = None
+MUTEX_OWNED = False
 
 
 def enable_multi_instance():
-    """Hold Roblox's singleton mutex/event so more than one client can run at once.
-    Must happen BEFORE any Roblox client starts, and this bot must stay running."""
-    if not IS_WINDOWS or _mutex_handles:
-        return
+    """Own Roblox's singleton mutex so several clients can run side by side on this PC.
+    Safe to call as often as you like: if another Roblox on this PC held the mutex earlier
+    and has since closed, this picks the mutex up on the next call.
+    Returns True if this bot owns the mutex."""
+    global _mutex_handle, _event_handle, MUTEX_OWNED
+    if not IS_WINDOWS:
+        return False
+    if MUTEX_OWNED:
+        return True
     kernel32.CreateMutexW.restype = wintypes.HANDLE
     kernel32.CreateEventW.restype = wintypes.HANDLE
-    _mutex_handles.append(kernel32.CreateMutexW(None, True, "ROBLOX_singletonMutex"))
-    _mutex_handles.append(kernel32.CreateEventW(None, True, False, "ROBLOX_singletonEvent"))
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    if _mutex_handle is None:
+        _mutex_handle = kernel32.CreateMutexW(None, True, "ROBLOX_singletonMutex")
+        err = ctypes.get_last_error()
+        _event_handle = kernel32.CreateEventW(None, True, False, "ROBLOX_singletonEvent")
+        if _mutex_handle and err != 183:           # 183 = it already existed, owned by someone else
+            MUTEX_OWNED = True
+            return True
+    if _mutex_handle:
+        # the previous owner (a Roblox that was open) may have closed: try to take it over
+        res = kernel32.WaitForSingleObject(_mutex_handle, 0)
+        if res in (0x00000000, 0x00000080):          # WAIT_OBJECT_0 or WAIT_ABANDONED
+            MUTEX_OWNED = True
+    return MUTEX_OWNED
+
+
+def roblox_running():
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq RobloxPlayerBeta.exe"],
+                             capture_output=True, text=True, timeout=10).stdout
+        return "RobloxPlayerBeta.exe" in out
+    except Exception:
+        return False
+
+
+def close_all_roblox():
+    """Closes every Roblox client on THIS PC (only called when no lock is running)."""
+    try:
+        subprocess.run(["taskkill", "/IM", "RobloxPlayerBeta.exe", "/F", "/T"],
+                       capture_output=True, timeout=20)
+    except Exception:
+        pass
 
 
 def find_roblox_exe():
@@ -371,7 +411,6 @@ class Lock:
 
 
 lock_state = None                 # the active Lock or None
-launch_lock = asyncio.Lock() if False else None  # replaced in Bot.setup_hook (needs running loop)
 
 
 def start_one(client, place_id, job_id):
@@ -395,7 +434,6 @@ def start_one(client, place_id, job_id):
 
 def start_all(clients, place_id, job_id):
     """Blocking: launch alts one by one."""
-    enable_multi_instance()
     ok = 0
     for i, c in enumerate(clients):
         if i:
@@ -434,7 +472,6 @@ def stop_all(lock):
 
 async def monitor_loop(lock):
     """Keeps alts alive: relaunches crashed clients and moves everyone every MOVE_INTERVAL."""
-    global lock_state
     while lock_state is lock:
         await asyncio.sleep(MONITOR_TICK)
         if lock_state is not lock:
@@ -557,8 +594,14 @@ class PosGroup(app_commands.Group):
         if not find_roblox_exe():
             return await interaction.followup.send(embed=em(
                 "Roblox not found",
-                "Install Roblox from roblox.com on this PC (not the Microsoft Store version), "
+                "Install Roblox from roblox.com on the PC running this bot (not the Microsoft Store version), "
                 "or set ROBLOX_EXE in .env.", "err"))
+
+                # Best effort: close stray Roblox on the bot PC, then try to grab the mutex
+        if not enable_multi_instance():
+            await asyncio.to_thread(close_all_roblox)
+            await asyncio.sleep(3)
+            enable_multi_instance()
 
         try:
             alts = load_alts()
@@ -584,7 +627,7 @@ class PosGroup(app_commands.Group):
             return await interaction.followup.send(embed=em(
                 "No working alts", "\n".join(bad)[:3900] or "All cookies were rejected.", "err"))
 
-        # find the requester's server
+        # find the requester's server (they are already in it)
         try:
             place_id, job_id = await asyncio.to_thread(
                 locate_user, [c["cookie"] for c in clients], linked["id"], linked["name"])
@@ -720,8 +763,12 @@ class Bot(discord.Client):
     async def on_ready(self):
         print(f"Logged in as {self.user}")
         if IS_WINDOWS:
-            enable_multi_instance()
             print(f"Roblox client: {find_roblox_exe() or 'NOT FOUND'}")
+            if MUTEX_OWNED:
+                print("Multi-client lock: OK")
+            else:
+                print("Multi-client lock: waiting (Roblox is open on this PC). "
+                      "It is picked up automatically once that Roblox is closed.")
         else:
             print("WARNING: not Windows - /pos lock cannot launch Roblox clients here.")
 
@@ -729,4 +776,6 @@ class Bot(discord.Client):
 if __name__ == "__main__":
     if not TOKEN:
         sys.exit("DISCORD_TOKEN missing in .env")
+    if IS_WINDOWS:
+        enable_multi_instance()
     Bot().run(TOKEN)
