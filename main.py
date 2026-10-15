@@ -1,27 +1,33 @@
 """
-POS Locker Discord bot (Universal Cross-Platform: Mobile, Console, PC & Cloud)
+POS Locker Discord bot - runs real Roblox clients for your alts (Windows only)
 
 Commands:
-  /pos link [username]  - Link your Roblox account using an un-censorable word phrase
-  /pos lock count:N     - Finds your server and provides direct join links & Job ID for all devices
-  /pos stop             - Reset active lock state
-  /pos status           - Show current lock status
+  /pos link [username]  - Link your Roblox account using a word phrase
+  /pos lock [count]     - Finds the server you are in and makes your alts join it
+                          (one Roblox window per alt, they auto-move every 15 min)
+  /pos stats            - Show the current lock: alts, uptime, next move
+  /pos stop             - End the lock and close every alt's Roblox window
   /pos check            - Test every cookie in alts.json
 
 Needs:  pip install discord.py requests python-dotenv
 Files next to this one:
   .env      ->  DISCORD_TOKEN=xxxx
-  alts.json  ->  [{"name": "alt1", "cookie": "_|WARNING..."}, ...]
-  links.json ->  (Auto-generated for persistent data storage)
+                (optional) GUILD_ID, ROBLOX_EXE, MOVE_INTERVAL_MIN, MOVE_MODE, LAUNCH_DELAY
+  alts.json ->  [{"name": "alt1", "cookie": "_|WARNING..."}, {"name": "alt2", "cookie": "..."}]
+  links.json -> (auto-generated)
+
+IMPORTANT: this must run on a Windows PC that has Roblox (the normal player from
+roblox.com, not the Microsoft Store version) installed. It will NOT work on a Linux host.
 """
 
 import asyncio
+import glob
 import json
 import os
 import random
+import subprocess
 import sys
 import time
-import urllib.parse
 
 import discord
 import requests
@@ -32,13 +38,20 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 
-API_PARALLEL = 15               # Parallel Roblox API calls
+# ---------------------------------------------------------------- Settings
+API_PARALLEL = 15
 PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
+
+MOVE_INTERVAL = float(os.getenv("MOVE_INTERVAL_MIN", "15")) * 60   # seconds between anti-idle moves
+LAUNCH_DELAY = float(os.getenv("LAUNCH_DELAY", "8"))               # seconds between launching each alt
+WINDOW_WAIT = 120                                                  # seconds to wait for a client window
+MOVE_MODE = os.getenv("MOVE_MODE", "focus").lower()                # "focus" (reliable) or "post" (silent, less reliable)
+MAX_RESTARTS = 3                                                   # auto-relaunch tries per alt
+MONITOR_TICK = 15                                                  # seconds between health checks
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 LINKS_FILE = os.path.join(BASE, "links.json")
 
-# Word list for un-censorable verification codes on Roblox
 VERIFY_WORDS = [
     "apple", "banana", "cherry", "dragon", "eagle", "falcon", "forest", "galaxy",
     "hammer", "island", "jungle", "knight", "lemon", "mango", "ninja", "orange",
@@ -46,6 +59,13 @@ VERIFY_WORDS = [
 ]
 
 COLORS = {"info": 0x5865F2, "ok": 0x2ECC71, "warn": 0xF1C40F, "err": 0xE74C3C}
+
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
 
 
 def em(title, desc=None, kind="info", fields=None):
@@ -190,15 +210,255 @@ def get_description(uid):
     return r.json().get("description") or ""
 
 
-# ---------------------------------------------------------------- Bot State
-class State:
-    place_id = None
-    job_id = None
-    started = 0
-    target = ""
+# ---------------------------------------------------------------- Roblox client launching (Windows)
+_mutex_handles = []
 
 
-state = State()
+def enable_multi_instance():
+    """Hold Roblox's singleton mutex/event so more than one client can run at once.
+    Must happen BEFORE any Roblox client starts, and this bot must stay running."""
+    if not IS_WINDOWS or _mutex_handles:
+        return
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateEventW.restype = wintypes.HANDLE
+    _mutex_handles.append(kernel32.CreateMutexW(None, True, "ROBLOX_singletonMutex"))
+    _mutex_handles.append(kernel32.CreateEventW(None, True, False, "ROBLOX_singletonEvent"))
+
+
+def find_roblox_exe():
+    custom = os.getenv("ROBLOX_EXE")
+    if custom and os.path.exists(custom):
+        return custom
+    roots = [
+        os.path.join(os.getenv("LOCALAPPDATA", ""), "Roblox", "Versions"),
+        os.path.join(os.getenv("ProgramFiles(x86)", ""), "Roblox", "Versions"),
+        os.path.join(os.getenv("ProgramFiles", ""), "Roblox", "Versions"),
+    ]
+    found = []
+    for r in roots:
+        found += glob.glob(os.path.join(r, "*", "RobloxPlayerBeta.exe"))
+    if not found:
+        return None
+    return max(found, key=os.path.getmtime)
+
+
+def get_auth_ticket(cookie):
+    url = "https://auth.roblox.com/v1/authentication-ticket"
+    headers = {
+        "Cookie": f".ROBLOSECURITY={cookie}",
+        "Referer": "https://www.roblox.com/",
+        "Origin": "https://www.roblox.com",
+        "Content-Type": "application/json",
+    }
+    r = http("POST", url, headers=headers, data="{}")
+    if r.status_code == 403 and "x-csrf-token" in r.headers:
+        headers["X-CSRF-TOKEN"] = r.headers["x-csrf-token"]
+        r = http("POST", url, headers=headers, data="{}")
+    ticket = r.headers.get("rbx-authentication-ticket")
+    if not ticket:
+        raise RuntimeError(f"Roblox gave no login ticket (HTTP {r.status_code}). Cookie may be expired.")
+    return ticket
+
+
+def windows_for_pid(pid):
+    found = []
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        if user32.IsWindowVisible(hwnd):
+            p = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+            if p.value == pid:
+                found.append(hwnd)
+        return True
+
+    user32.EnumWindows(enum_proc(cb), 0)
+    return found
+
+
+def launch_client(cookie, place_id, job_id):
+    """Start one Roblox client logged in as the cookie's account, joining the exact server."""
+    exe = find_roblox_exe()
+    if not exe:
+        raise RuntimeError("RobloxPlayerBeta.exe not found. Install Roblox from roblox.com "
+                           "(not the Microsoft Store version) or set ROBLOX_EXE in .env.")
+    ticket = get_auth_ticket(cookie)
+    tracker = str(random.randint(10 ** 10, 10 ** 11 - 1))
+    launcher = ("https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGameJob"
+                f"&browserTrackerId={tracker}&placeId={place_id}&gameId={job_id}&isPlayTogetherGame=false")
+    args = [exe, "--app", "-t", ticket, "-j", launcher, "-b", tracker,
+            f"--launchtime={int(time.time() * 1000)}", "--rloc", "en_us", "--gloc", "en_us"]
+    return subprocess.Popen(args)
+
+
+def wait_for_window(proc, timeout=WINDOW_WAIT):
+    end = time.time() + timeout
+    while time.time() < end:
+        if proc.poll() is not None:
+            return None
+        w = windows_for_pid(proc.pid)
+        if w:
+            return w[0]
+        time.sleep(1)
+    return None
+
+
+def kill_proc(proc):
+    if proc is None:
+        return
+    try:
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=15)
+        else:
+            proc.kill()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- Anti-idle movement
+VK_W, VK_S, VK_A, VK_D, VK_SPACE, VK_MENU = 0x57, 0x53, 0x41, 0x44, 0x20, 0x12
+
+
+def _tap_focus(vk, hold):
+    scan = user32.MapVirtualKeyW(vk, 0)
+    user32.keybd_event(vk, scan, 0, 0)
+    time.sleep(hold)
+    user32.keybd_event(vk, scan, 2, 0)
+    time.sleep(0.15)
+
+
+def _tap_post(hwnd, vk, hold):
+    scan = user32.MapVirtualKeyW(vk, 0)
+    down = 1 | (scan << 16)
+    up = 1 | (scan << 16) | (1 << 30) | (1 << 31)
+    user32.PostMessageW(hwnd, 0x0100, vk, down)
+    time.sleep(hold)
+    user32.PostMessageW(hwnd, 0x0101, vk, up)
+    time.sleep(0.15)
+
+
+def move_window(hwnd):
+    """Walk around a little so Roblox does not kick the alt for being idle."""
+    keys = [(VK_SPACE, 0.2), (VK_W, 0.5), (VK_S, 0.5), (VK_A, 0.3), (VK_D, 0.3), (VK_SPACE, 0.2)]
+    if MOVE_MODE == "post":
+        for vk, hold in keys:
+            _tap_post(hwnd, vk, hold)
+        return
+    prev = user32.GetForegroundWindow()
+    user32.ShowWindow(hwnd, 9)                       # restore if minimized
+    user32.keybd_event(VK_MENU, 0, 0, 0)             # lets us take the foreground
+    user32.keybd_event(VK_MENU, 0, 2, 0)
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.8)
+    for vk, hold in keys:
+        _tap_focus(vk, hold)
+    if prev and prev != hwnd:
+        user32.SetForegroundWindow(prev)             # give the PC back to the user
+
+
+# ---------------------------------------------------------------- Lock state
+class Lock:
+    def __init__(self, owner_id, target, place_id, job_id):
+        self.owner_id = owner_id
+        self.target = target
+        self.place_id = place_id
+        self.job_id = job_id
+        self.started = time.time()
+        self.next_move = time.time() + MOVE_INTERVAL
+        self.clients = []          # dicts: name, roblox, cookie, proc, hwnd, restarts, last_move, status
+        self.task = None
+
+
+lock_state = None                 # the active Lock or None
+launch_lock = asyncio.Lock() if False else None  # replaced in Bot.setup_hook (needs running loop)
+
+
+def start_one(client, place_id, job_id):
+    """Blocking: launch one alt and wait for its window. Returns True on success."""
+    try:
+        proc = launch_client(client["cookie"], place_id, job_id)
+    except Exception as e:
+        client["status"] = f"launch failed: {e}"
+        client["proc"] = None
+        return False
+    client["proc"] = proc
+    hwnd = wait_for_window(proc)
+    client["hwnd"] = hwnd
+    if hwnd:
+        client["status"] = "in game"
+        client["last_move"] = time.time()
+        return True
+    client["status"] = "window never appeared" if proc.poll() is None else "client closed on start"
+    return False
+
+
+def start_all(clients, place_id, job_id):
+    """Blocking: launch alts one by one."""
+    enable_multi_instance()
+    ok = 0
+    for i, c in enumerate(clients):
+        if i:
+            time.sleep(LAUNCH_DELAY)
+        if start_one(c, place_id, job_id):
+            ok += 1
+    return ok
+
+
+def move_all(clients):
+    for c in clients:
+        proc = c.get("proc")
+        if not proc or proc.poll() is not None:
+            continue
+        hwnd = c.get("hwnd")
+        if not hwnd or not user32.IsWindow(hwnd):
+            w = windows_for_pid(proc.pid)
+            hwnd = w[0] if w else None
+            c["hwnd"] = hwnd
+        if not hwnd:
+            continue
+        try:
+            move_window(hwnd)
+            c["last_move"] = time.time()
+        except Exception as e:
+            c["status"] = f"move failed: {e}"
+        time.sleep(1)
+
+
+def stop_all(lock):
+    for c in lock.clients:
+        kill_proc(c.get("proc"))
+        c["proc"] = None
+        c["status"] = "closed"
+
+
+async def monitor_loop(lock):
+    """Keeps alts alive: relaunches crashed clients and moves everyone every MOVE_INTERVAL."""
+    global lock_state
+    while lock_state is lock:
+        await asyncio.sleep(MONITOR_TICK)
+        if lock_state is not lock:
+            break
+        for c in lock.clients:
+            proc = c.get("proc")
+            dead = proc is None or proc.poll() is not None
+            if dead and c["restarts"] < MAX_RESTARTS and c.get("status") != "closed":
+                c["restarts"] += 1
+                c["status"] = f"relaunching (try {c['restarts']}/{MAX_RESTARTS})"
+                await asyncio.to_thread(start_one, c, lock.place_id, lock.job_id)
+                await asyncio.sleep(LAUNCH_DELAY)
+            elif dead:
+                c["status"] = "dead (out of retries)"
+        if lock_state is lock and time.time() >= lock.next_move:
+            await asyncio.to_thread(move_all, lock.clients)
+            lock.next_move = time.time() + MOVE_INTERVAL
+
+
+def fmt_dur(sec):
+    sec = int(max(0, sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m}m" if h else f"{m}m {s}s"
 
 
 # ---------------------------------------------------------------- Verify View
@@ -220,24 +480,21 @@ class VerifyView(discord.ui.View):
             desc = await asyncio.to_thread(get_description, pend["id"])
         except Exception as e:
             return await interaction.followup.send(embed=em("Check failed", str(e), "err"), ephemeral=True)
-        
-        clean_desc = desc.lower().strip()
-        clean_code = pend["code"].lower().strip()
 
-        if clean_code not in clean_desc:
+        if pend["code"].lower().strip() not in desc.lower():
             return await interaction.followup.send(
                 embed=em("Code not found",
                          f"I can't see `{pend['code']}` in the About section of {pend['name']} yet. "
                          "Save your profile, wait a few seconds, then press Verify again.", "warn"),
                 ephemeral=True)
-        
+
         data["linked"][me] = {"id": pend["id"], "name": pend["name"]}
         data["pending"].pop(me, None)
         save_links(data)
         await interaction.followup.send(
             embed=em("Account linked",
                      f"Successfully linked to **{pend['name']}**! You can remove the phrase from your profile now.\n"
-                     "Join your server, then run `/pos lock count:5`", "ok"),
+                     "Join your server, then run `/pos lock`", "ok"),
             ephemeral=True)
 
 
@@ -270,22 +527,38 @@ class PosGroup(app_commands.Group):
         code = f"verify {w1} {w2}"
         data["pending"][me] = {"id": uid, "name": name, "code": code}
         save_links(data)
-        
+
         await interaction.followup.send(
             embed=em(f"Verify {name}",
                      "Put this exact phrase anywhere in your Roblox profile About section, save it, "
                      f"then press **Verify** below.\n\n```{code}```", "info"),
             view=VerifyView(), ephemeral=True)
 
-    @app_commands.command(name="lock", description="Find active server and share instant join links")
-    @app_commands.describe(count="How many alts to use for checking presence")
-    async def lock(self, interaction: discord.Interaction, count: app_commands.Range[int, 1, 100]):
+    @app_commands.command(name="lock", description="Send your alts into the server you are in")
+    @app_commands.describe(count="How many alts to send (default: all in alts.json)")
+    async def lock(self, interaction: discord.Interaction, count: app_commands.Range[int, 1, 100] = 100):
+        global lock_state
         await interaction.response.defer()
+
+        if not IS_WINDOWS:
+            return await interaction.followup.send(embed=em(
+                "Windows only", "Launching Roblox clients only works when the bot runs on a Windows PC.", "err"))
 
         linked = load_links()["linked"].get(str(interaction.user.id))
         if not linked:
             return await interaction.followup.send(
                 embed=em("No account linked", "Run `/pos link` with your Roblox username first.", "err"))
+
+        if lock_state is not None:
+            return await interaction.followup.send(embed=em(
+                "Lock already running",
+                f"A lock for **{lock_state.target}** is active. Run `/pos stop` first.", "warn"))
+
+        if not find_roblox_exe():
+            return await interaction.followup.send(embed=em(
+                "Roblox not found",
+                "Install Roblox from roblox.com on this PC (not the Microsoft Store version), "
+                "or set ROBLOX_EXE in .env.", "err"))
 
         try:
             alts = load_alts()
@@ -293,35 +566,106 @@ class PosGroup(app_commands.Group):
             return await interaction.followup.send(embed=em("Cannot read alts.json", str(e), "err"))
         if not alts:
             return await interaction.followup.send(embed=em("No alts", "alts.json is empty.", "err"))
-
         alts = alts[:count]
 
+        # validate cookies first so we only launch working alts
+        async def verify_alt(a):
+            try:
+                _, rname = await asyncio.to_thread(whoami, a["cookie"])
+                return {"name": a["name"], "roblox": rname, "cookie": a["cookie"], "proc": None,
+                        "hwnd": None, "restarts": 0, "last_move": 0, "status": "queued"}, None
+            except Exception as e:
+                return None, f"{a['name']}: {e}"
+
+        results = await asyncio.gather(*(verify_alt(a) for a in alts))
+        clients = [c for c, _ in results if c]
+        bad = [err for _, err in results if err]
+        if not clients:
+            return await interaction.followup.send(embed=em(
+                "No working alts", "\n".join(bad)[:3900] or "All cookies were rejected.", "err"))
+
+        # find the requester's server
         try:
             place_id, job_id = await asyncio.to_thread(
-                locate_user, [a["cookie"] for a in alts], linked["id"], linked["name"])
+                locate_user, [c["cookie"] for c in clients], linked["id"], linked["name"])
         except Exception as e:
             return await interaction.followup.send(embed=em("Server not found", str(e), "err"))
 
-        state.place_id, state.job_id, state.started = place_id, job_id, time.time()
-        state.target = linked["name"]
-
-        # Universal Quick Join Links for Mobile, Console, & PC
-        roblox_app_link = f"https://www.roblox.com/games/start?placeId={place_id}&gameInstanceId={job_id}"
-        web_game_page = f"https://www.roblox.com/games/{place_id}"
-
-        fields = [
-            ("Target User", linked["name"], True),
-            ("Place ID", f"`{place_id}`", True),
-            ("Job / Server ID", f"`{job_id}`", False),
-            ("Direct Join Link (Mobile/PC/Console)", f"[Click to Join Server]({roblox_app_link})", False),
-            ("Game Page", f"[Open Roblox Game Page]({web_game_page})", False)
-        ]
+        new_lock = Lock(interaction.user.id, linked["name"], place_id, job_id)
+        new_lock.clients = clients
+        lock_state = new_lock
 
         await interaction.followup.send(embed=em(
-            "Server Found & Target Locked",
-            f"Successfully detected **{linked['name']}** in the server below. "
-            "Anyone on Mobile, Console, or PC can use the links or Job ID to join immediately.",
-            "ok", fields))
+            "Server found - launching alts",
+            f"Locking **{linked['name']}**'s server with {len(clients)} alt(s). "
+            "This takes about a minute per alt, I will post when it finishes.", "info"))
+
+        ok = await asyncio.to_thread(start_all, clients, place_id, job_id)
+
+        if lock_state is not new_lock:           # /pos stop was used while launching
+            stop_all(new_lock)
+            return
+        if ok == 0:
+            stop_all(new_lock)
+            lock_state = None
+            lines = "\n".join(f"{c['name']}: {c['status']}" for c in clients)
+            return await interaction.channel.send(embed=em(
+                "Lock failed", f"No alt could join.\n{lines}"[:3900], "err"))
+
+        new_lock.next_move = time.time() + MOVE_INTERVAL
+        new_lock.task = asyncio.create_task(monitor_loop(new_lock))
+
+        lines = [f"[{'OK' if c['status'] == 'in game' else 'FAIL'}] {c['name']} ({c['roblox']}) - {c['status']}"
+                 for c in clients] + [f"[SKIPPED] {b}" for b in bad]
+        await interaction.channel.send(embed=em(
+            "Position lock active", "\n".join(lines)[:3900], "ok",
+            [("Target", linked["name"], True),
+             ("Alts in server", f"{ok} / {len(clients)}", True),
+             ("Move interval", f"{int(MOVE_INTERVAL // 60)} min", True),
+             ("Job / Server ID", f"`{job_id}`", False)]))
+
+    @app_commands.command(name="stats", description="Show the active position lock")
+    async def stats(self, interaction: discord.Interaction):
+        lk = lock_state
+        if lk is None:
+            return await interaction.response.send_message(
+                embed=em("Idle", "No position lock is running.", "info"))
+        lines = []
+        for c in lk.clients:
+            alive = c["proc"] is not None and c["proc"].poll() is None
+            moved = f"moved {fmt_dur(time.time() - c['last_move'])} ago" if c["last_move"] else "not moved yet"
+            lines.append(f"[{'UP' if alive else 'DOWN'}] {c['name']} ({c['roblox']}) - {c['status']}, {moved}, "
+                         f"restarts {c['restarts']}")
+        up = sum(1 for c in lk.clients if c["proc"] is not None and c["proc"].poll() is None)
+        await interaction.response.send_message(embed=em(
+            "Position lock active", "\n".join(lines)[:3900], "ok",
+            [("Target", lk.target, True),
+             ("Requested by", f"<@{lk.owner_id}>", True),
+             ("Alts up", f"{up} / {len(lk.clients)}", True),
+             ("Running for", fmt_dur(time.time() - lk.started), True),
+             ("Next move in", fmt_dur(lk.next_move - time.time()), True),
+             ("Job / Server ID", f"`{lk.job_id}`", False)]))
+
+    @app_commands.command(name="stop", description="End the position lock and close the alts")
+    async def stop(self, interaction: discord.Interaction):
+        global lock_state
+        lk = lock_state
+        if lk is None:
+            return await interaction.response.send_message(
+                embed=em("Idle", "No position lock is running.", "info"), ephemeral=True)
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if interaction.user.id != lk.owner_id and not (perms and perms.manage_guild):
+            return await interaction.response.send_message(embed=em(
+                "Not allowed", "Only the person who started the lock or a server manager can stop it.", "err"),
+                ephemeral=True)
+        await interaction.response.defer()
+        lock_state = None
+        if lk.task:
+            lk.task.cancel()
+        await asyncio.to_thread(stop_all, lk)
+        await interaction.followup.send(embed=em(
+            "Position lock ended",
+            f"Closed {len(lk.clients)} alt client(s). Ran for {fmt_dur(time.time() - lk.started)}.", "ok"))
 
     @app_commands.command(name="check", description="Test every cookie in alts.json")
     async def check(self, interaction: discord.Interaction):
@@ -348,25 +692,6 @@ class PosGroup(app_commands.Group):
                      "ok" if good == len(res) else "warn", [("Working", f"{good} / {len(res)}", True)]),
             ephemeral=True)
 
-    @app_commands.command(name="stop", description="Reset active lock state")
-    async def stop(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        state.job_id = None
-        state.target = ""
-        await interaction.followup.send(embed=em("Stopped", "Lock state cleared successfully.", "ok"))
-
-    @app_commands.command(name="status", description="Show active lock status")
-    async def status(self, interaction: discord.Interaction):
-        if state.job_id:
-            mins = int((time.time() - state.started) // 60)
-            await interaction.response.send_message(embed=em(
-                "Lock Active", None, "ok",
-                [("Active for", f"{mins} min", True),
-                 ("Target", state.target, True),
-                 ("Server ID", f"`{state.job_id}`", False)]))
-        else:
-            await interaction.response.send_message(embed=em("Idle", "No active lock server recorded.", "info"))
-
 
 class Bot(discord.Client):
     def __init__(self):
@@ -383,9 +708,22 @@ class Bot(discord.Client):
         else:
             await self.tree.sync()
 
+    async def close(self):
+        global lock_state
+        if lock_state is not None:
+            lk, lock_state = lock_state, None
+            if lk.task:
+                lk.task.cancel()
+            stop_all(lk)
+        await super().close()
+
     async def on_ready(self):
         print(f"Logged in as {self.user}")
-        print("Bot ready for cross-platform usage (Mobile, Console, PC, Cloud).")
+        if IS_WINDOWS:
+            enable_multi_instance()
+            print(f"Roblox client: {find_roblox_exe() or 'NOT FOUND'}")
+        else:
+            print("WARNING: not Windows - /pos lock cannot launch Roblox clients here.")
 
 
 if __name__ == "__main__":
