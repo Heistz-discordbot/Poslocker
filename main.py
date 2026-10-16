@@ -1,781 +1,796 @@
-"""
-POS Locker Discord bot - runs real Roblox clients for your alts (Windows only)
+from pathlib import Path
 
-Commands:
-  /pos link [username]  - Link your Roblox account using a word phrase
-  /pos lock [count]     - Finds the server you are in and makes your alts join it
-                          (one Roblox window per alt, they auto-move every 15 min)
-  /pos stats            - Show the current lock: alts, uptime, next move
-  /pos stop             - End the lock and close every alt's Roblox window
-  /pos check            - Test every cookie in alts.json
+code = r'''"""
+Railway-friendly Discord position-management bot.
 
-Needs:  pip install discord.py requests python-dotenv
-Files next to this one:
-  .env      ->  DISCORD_TOKEN=xxxx
-                (optional) GUILD_ID, ROBLOX_EXE, MOVE_INTERVAL_MIN, MOVE_MODE, LAUNCH_DELAY,
-                CLOSE_HOST_ROBLOX=1
-  alts.json ->  [{"name": "alt1", "cookie": "_|WARNING..."}, {"name": "alt2", "cookie": "..."}]
-  links.json -> (auto-generated)
+This version manages panels, profile listings, private tickets, reviews and logs.
+It does NOT log into Roblox with account cookies or automate mass game joins.
+Keep Roblox .ROBLOSECURITY cookies out of Discord messages and source control.
 
-Run this on a Windows PC with the normal Roblox player (roblox.com, not the Microsoft
-Store version). Players use /pos lock from their OWN devices, after they are already in
-the server. The bot PC itself should not have its own Roblox open.
+Install:
+    pip install -U discord.py python-dotenv
+
+Railway variables:
+    DISCORD_TOKEN       required
+    OWNER_ID            your Discord user ID (recommended)
+    PANEL_CHANNEL_ID    1560668012120645693
+    PANEL_CATEGORY_ID   1560667887159742487
+    TICKET_CATEGORY_ID  1560667942927077556
+    LOG_CHANNEL_ID      1560668040025346068
+
+Files beside main.py:
+    alts.json           public account metadata only (no cookies needed)
+    bot_data.json       auto-created persistent data; use a Railway Volume
 """
 
 import asyncio
-import glob
 import json
 import os
-import random
-import subprocess
+import re
 import sys
 import time
+from pathlib import Path
+from typing import Optional
 
 import discord
-import requests
 from discord import app_commands
+from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")
 
-# ---------------------------------------------------------------- Settings
-API_PARALLEL = 15
-PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 
-MOVE_INTERVAL = float(os.getenv("MOVE_INTERVAL_MIN", "15")) * 60   # seconds between anti-idle moves
-LAUNCH_DELAY = float(os.getenv("LAUNCH_DELAY", "8"))               # seconds between launching each alt
-WINDOW_WAIT = 120                                                  # seconds to wait for a client window
-MOVE_MODE = os.getenv("MOVE_MODE", "focus").lower()                # "focus" (reliable) or "post" (silent, less reliable)
-CLOSE_HOST_ROBLOX = os.getenv("CLOSE_HOST_ROBLOX", "0") == "1"     # auto-close stray Roblox on the bot PC before locking
-MAX_RESTARTS = 3                                                   # auto-relaunch tries per alt
-MONITOR_TICK = 15                                                  # seconds between health checks
+PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "1560668012120645693"))
+PANEL_CATEGORY_ID = int(os.getenv("PANEL_CATEGORY_ID", "1560667887159742487"))
+TICKET_CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "1560667942927077556"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "1560668040025346068"))
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-LINKS_FILE = os.path.join(BASE, "links.json")
+BASE = Path(__file__).resolve().parent
+ALTS_FILE = BASE / "alts.json"
+DATA_FILE = Path(os.getenv("DATA_FILE", str(BASE / "bot_data.json")))
 
-VERIFY_WORDS = [
-    "apple", "banana", "cherry", "dragon", "eagle", "falcon", "forest", "galaxy",
-    "hammer", "island", "jungle", "knight", "lemon", "mango", "ninja", "orange",
-    "planet", "quantum", "rocket", "shadow", "tiger", "umbrella", "violet", "wizard"
-]
-
-COLORS = {"info": 0x5865F2, "ok": 0x2ECC71, "warn": 0xF1C40F, "err": 0xE74C3C}
-
-IS_WINDOWS = sys.platform == "win32"
-if IS_WINDOWS:
-    import ctypes
-    from ctypes import wintypes
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+COLORS = {
+    "info": discord.Color.blurple(),
+    "ok": discord.Color.green(),
+    "warn": discord.Color.gold(),
+    "err": discord.Color.red(),
+    "neutral": discord.Color.from_rgb(43, 45, 49),
+}
 
 
-def em(title, desc=None, kind="info", fields=None):
-    e = discord.Embed(title=title, description=desc, color=COLORS[kind])
-    for name, value, inline in (fields or []):
-        e.add_field(name=name, value=(value or "-")[:1024], inline=inline)
-    return e
+def embed(title: str, description: str = "", kind: str = "info") -> discord.Embed:
+    return discord.Embed(title=title, description=description, color=COLORS.get(kind, COLORS["info"]))
 
 
-# ---------------------------------------------------------------- Network / API Wrappers
-def http(method, url, retries=4, **kw):
-    kw.setdefault("timeout", 20)
-    last_exc = None
-    for i in range(retries):
-        try:
-            r = requests.request(method, url, **kw)
-            if r.status_code == 429:
-                time.sleep(2 ** i + random.random())
-                continue
-            return r
-        except (requests.ConnectionError, requests.Timeout) as e:
-            last_exc = e
-            time.sleep(1.5 * (i + 1) + random.random())
-    if last_exc is not None:
-        raise RuntimeError(f"Network error talking to Roblox ({type(last_exc).__name__}).")
-    raise RuntimeError("Roblox rate limit (HTTP 429). Wait a minute and try again.")
-
-
-def rb_post(cookie, url, body):
-    headers = {"Content-Type": "application/json"}
-    if cookie:
-        headers["Cookie"] = f".ROBLOSECURITY={cookie}"
-    r = http("POST", url, headers=headers, json=body)
-    if r.status_code == 403 and "x-csrf-token" in r.headers:
-        headers["X-CSRF-TOKEN"] = r.headers["x-csrf-token"]
-        r = http("POST", url, headers=headers, json=body)
-    r.raise_for_status()
-    return r.json()
-
-
-# ---------------------------------------------------------------- Alts and Data Helpers
-def clean_cookie(c):
-    c = (c or "").strip().strip("\"'")
-    if c.upper().startswith(".ROBLOSECURITY="):
-        c = c.split("=", 1)[1]
-    return "".join(c.strip().strip("\"';").split())
-
-
-def load_alts():
-    alts_path = os.path.join(BASE, "alts.json")
-    if not os.path.exists(alts_path):
-        return []
-    with open(alts_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    items = data.get("alts", data) if isinstance(data, dict) else data
-    alts = []
-    for i, a in enumerate(items):
-        if isinstance(a, str):
-            alts.append({"name": f"alt{i + 1}", "cookie": clean_cookie(a)})
-        else:
-            cookie = a.get("cookie") or a.get("roblosecurity") or a.get(".ROBLOSECURITY")
-            alts.append({"name": a.get("name") or a.get("username") or f"alt{i + 1}",
-                         "cookie": clean_cookie(cookie)})
-    return alts
-
-
-def whoami(cookie):
-    r = http("GET", "https://users.roblox.com/v1/users/authenticated",
-             headers={"Cookie": f".ROBLOSECURITY={cookie}"})
-    if r.status_code != 200:
-        raise RuntimeError(f"Cookie rejected by Roblox (HTTP {r.status_code})")
-    j = r.json()
-    return j["id"], j["name"]
-
-
-def user_id_from_name(username):
-    username = username.strip().lstrip("@")
-    res = rb_post(None, "https://users.roblox.com/v1/usernames/users",
-                  {"usernames": [username], "excludeBannedUsers": False})
-    if not res.get("data"):
-        raise RuntimeError(f"Roblox user {username} not found.")
-    return res["data"][0]["id"], res["data"][0]["name"]
-
-
-def read_presence(cookies, uid):
-    best = 0
-    for c in cookies[:10]:
-        try:
-            p = rb_post(c, PRESENCE_URL, {"userIds": [uid]})["userPresences"][0]
-        except Exception:
-            continue
-        t = p.get("userPresenceType", 0)
-        best = max(best, t)
-        if t == 2 and p.get("gameId") and p.get("placeId"):
-            return t, int(p["placeId"]), p["gameId"]
-    return best, None, None
-
-
-def locate_user(cookies, uid, name):
-    seen = 0
-    for _ in range(3):
-        t, place, job = read_presence(cookies, uid)
-        seen = max(seen, t)
-        if place:
-            time.sleep(1)
-            _, place2, job2 = read_presence(cookies, uid)
-            if job2 == job:
-                return place, job
-        else:
-            time.sleep(1)
-    if seen == 2:
-        raise RuntimeError(
-            f"{name} is in a game, but Roblox hides server details. Fix: Roblox Settings > Privacy > "
-            "'Who can join me' = Everyone, or make that account friends with the alts."
-        )
-    if seen in (0, 1):
-        raise RuntimeError(f"{name} is not in a game right now. Join the server first, then run the command.")
-    raise RuntimeError(f"Could not read {name}'s server. Try again in a few seconds.")
-
-
-def load_links():
+def load_data() -> dict:
     try:
-        if not os.path.exists(LINKS_FILE):
-            return {"linked": {}, "pending": {}}
-        with open(LINKS_FILE, "r", encoding="utf-8") as f:
+        with DATA_FILE.open("r", encoding="utf-8") as f:
             data = json.load(f)
-            data.setdefault("linked", {})
-            data.setdefault("pending", {})
-            return data
-    except Exception:
-        return {"linked": {}, "pending": {}}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {}
+    data.setdefault("guilds", {})
+    data.setdefault("tickets", {})
+    data.setdefault("next_ticket", {})
+    data.setdefault("created_channels", {})
+    return data
 
 
-def save_links(data):
-    with open(LINKS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+def save_data(data: dict) -> None:
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = DATA_FILE.with_suffix(".tmp")
+    with temp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    temp.replace(DATA_FILE)
 
 
-def get_description(uid):
-    r = http("GET", f"https://users.roblox.com/v1/users/{uid}")
-    r.raise_for_status()
-    return r.json().get("description") or ""
+def guild_data(data: dict, guild_id: int) -> dict:
+    return data["guilds"].setdefault(str(guild_id), {})
 
 
-# ---------------------------------------------------------------- Roblox client launching (Windows)
-_mutex_handle = None
-_event_handle = None
-MUTEX_OWNED = False
+def safe_slug(value: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9-]", "-", value.lower())
+    value = re.sub(r"-+", "-", value).strip("-")
+    return value[:30] or "member"
 
 
-def enable_multi_instance():
-    """Own Roblox's singleton mutex so several clients can run side by side on this PC.
-    Safe to call as often as you like: if another Roblox on this PC held the mutex earlier
-    and has since closed, this picks the mutex up on the next call.
-    Returns True if this bot owns the mutex."""
-    global _mutex_handle, _event_handle, MUTEX_OWNED
-    if not IS_WINDOWS:
-        return False
-    if MUTEX_OWNED:
-        return True
-    kernel32.CreateMutexW.restype = wintypes.HANDLE
-    kernel32.CreateEventW.restype = wintypes.HANDLE
-    kernel32.WaitForSingleObject.restype = wintypes.DWORD
-    if _mutex_handle is None:
-        _mutex_handle = kernel32.CreateMutexW(None, True, "ROBLOX_singletonMutex")
-        err = ctypes.get_last_error()
-        _event_handle = kernel32.CreateEventW(None, True, False, "ROBLOX_singletonEvent")
-        if _mutex_handle and err != 183:           # 183 = it already existed, owned by someone else
-            MUTEX_OWNED = True
-            return True
-    if _mutex_handle:
-        # the previous owner (a Roblox that was open) may have closed: try to take it over
-        res = kernel32.WaitForSingleObject(_mutex_handle, 0)
-        if res in (0x00000000, 0x00000080):          # WAIT_OBJECT_0 or WAIT_ABANDONED
-            MUTEX_OWNED = True
-    return MUTEX_OWNED
-
-
-def roblox_running():
-    try:
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq RobloxPlayerBeta.exe"],
-                             capture_output=True, text=True, timeout=10).stdout
-        return "RobloxPlayerBeta.exe" in out
-    except Exception:
-        return False
-
-
-def close_all_roblox():
-    """Closes every Roblox client on THIS PC (only called when no lock is running)."""
-    try:
-        subprocess.run(["taskkill", "/IM", "RobloxPlayerBeta.exe", "/F", "/T"],
-                       capture_output=True, timeout=20)
-    except Exception:
-        pass
-
-
-def find_roblox_exe():
-    custom = os.getenv("ROBLOX_EXE")
-    if custom and os.path.exists(custom):
-        return custom
-    roots = [
-        os.path.join(os.getenv("LOCALAPPDATA", ""), "Roblox", "Versions"),
-        os.path.join(os.getenv("ProgramFiles(x86)", ""), "Roblox", "Versions"),
-        os.path.join(os.getenv("ProgramFiles", ""), "Roblox", "Versions"),
-    ]
-    found = []
-    for r in roots:
-        found += glob.glob(os.path.join(r, "*", "RobloxPlayerBeta.exe"))
-    if not found:
-        return None
-    return max(found, key=os.path.getmtime)
-
-
-def get_auth_ticket(cookie):
-    url = "https://auth.roblox.com/v1/authentication-ticket"
-    headers = {
-        "Cookie": f".ROBLOSECURITY={cookie}",
-        "Referer": "https://www.roblox.com/",
-        "Origin": "https://www.roblox.com",
-        "Content-Type": "application/json",
-    }
-    r = http("POST", url, headers=headers, data="{}")
-    if r.status_code == 403 and "x-csrf-token" in r.headers:
-        headers["X-CSRF-TOKEN"] = r.headers["x-csrf-token"]
-        r = http("POST", url, headers=headers, data="{}")
-    ticket = r.headers.get("rbx-authentication-ticket")
-    if not ticket:
-        raise RuntimeError(f"Roblox gave no login ticket (HTTP {r.status_code}). Cookie may be expired.")
-    return ticket
-
-
-def windows_for_pid(pid):
-    found = []
-    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    def cb(hwnd, _):
-        if user32.IsWindowVisible(hwnd):
-            p = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
-            if p.value == pid:
-                found.append(hwnd)
-        return True
-
-    user32.EnumWindows(enum_proc(cb), 0)
-    return found
-
-
-def launch_client(cookie, place_id, job_id):
-    """Start one Roblox client logged in as the cookie's account, joining the exact server."""
-    exe = find_roblox_exe()
-    if not exe:
-        raise RuntimeError("RobloxPlayerBeta.exe not found. Install Roblox from roblox.com "
-                           "(not the Microsoft Store version) or set ROBLOX_EXE in .env.")
-    ticket = get_auth_ticket(cookie)
-    tracker = str(random.randint(10 ** 10, 10 ** 11 - 1))
-    launcher = ("https://assetgame.roblox.com/game/PlaceLauncher.ashx?request=RequestGameJob"
-                f"&browserTrackerId={tracker}&placeId={place_id}&gameId={job_id}&isPlayTogetherGame=false")
-    args = [exe, "--app", "-t", ticket, "-j", launcher, "-b", tracker,
-            f"--launchtime={int(time.time() * 1000)}", "--rloc", "en_us", "--gloc", "en_us"]
-    return subprocess.Popen(args)
-
-
-def wait_for_window(proc, timeout=WINDOW_WAIT):
-    end = time.time() + timeout
-    while time.time() < end:
-        if proc.poll() is not None:
-            return None
-        w = windows_for_pid(proc.pid)
-        if w:
-            return w[0]
-        time.sleep(1)
-    return None
-
-
-def kill_proc(proc):
-    if proc is None:
-        return
-    try:
-        if IS_WINDOWS:
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                           capture_output=True, timeout=15)
+def load_alts() -> list[dict]:
+    """Read display-safe account metadata only; never return cookie/session fields."""
+    if not ALTS_FILE.exists():
+        return []
+    with ALTS_FILE.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+    items = raw.get("alts", []) if isinstance(raw, dict) else raw
+    results = []
+    for i, item in enumerate(items):
+        if isinstance(item, str):
+            username = item.strip().lstrip("@")
+            if not username:
+                continue
+            alt = {"name": username, "username": username}
+        elif isinstance(item, dict):
+            username = str(item.get("username") or item.get("roblox_username") or item.get("name") or "").strip().lstrip("@")
+            display = str(item.get("display_name") or item.get("name") or username or f"Account {i + 1}").strip()
+            alt = {
+                "name": display[:80],
+                "username": username[:80],
+                "user_id": str(item.get("user_id") or item.get("id") or "").strip(),
+                "profile_url": str(item.get("profile_url") or "").strip(),
+            }
         else:
-            proc.kill()
-    except Exception:
-        pass
+            continue
+
+        # Deliberately ignore cookie, roblosecurity, password, token and other secret fields.
+        url = alt.get("profile_url", "")
+        if not url and alt.get("user_id").isdigit():
+            url = f"https://www.roblox.com/users/{alt['user_id']}/profile"
+        if not url and alt.get("username"):
+            url = f"https://www.roblox.com/search/users?keyword={alt['username']}"
+        alt["profile_url"] = url if url.startswith("https://www.roblox.com/") else ""
+        alt["key"] = alt.get("user_id") or alt.get("username") or f"account-{i + 1}"
+        if alt.get("username") or alt.get("profile_url"):
+            results.append(alt)
+    return results
 
 
-# ---------------------------------------------------------------- Anti-idle movement
-VK_W, VK_S, VK_A, VK_D, VK_SPACE, VK_MENU = 0x57, 0x53, 0x41, 0x44, 0x20, 0x12
-
-
-def _tap_focus(vk, hold):
-    scan = user32.MapVirtualKeyW(vk, 0)
-    user32.keybd_event(vk, scan, 0, 0)
-    time.sleep(hold)
-    user32.keybd_event(vk, scan, 2, 0)
-    time.sleep(0.15)
-
-
-def _tap_post(hwnd, vk, hold):
-    scan = user32.MapVirtualKeyW(vk, 0)
-    down = 1 | (scan << 16)
-    up = 1 | (scan << 16) | (1 << 30) | (1 << 31)
-    user32.PostMessageW(hwnd, 0x0100, vk, down)
-    time.sleep(hold)
-    user32.PostMessageW(hwnd, 0x0101, vk, up)
-    time.sleep(0.15)
-
-
-def move_window(hwnd):
-    """Walk around a little so Roblox does not kick the alt for being idle."""
-    keys = [(VK_SPACE, 0.2), (VK_W, 0.5), (VK_S, 0.5), (VK_A, 0.3), (VK_D, 0.3), (VK_SPACE, 0.2)]
-    if MOVE_MODE == "post":
-        for vk, hold in keys:
-            _tap_post(hwnd, vk, hold)
-        return
-    prev = user32.GetForegroundWindow()
-    user32.ShowWindow(hwnd, 9)                       # restore if minimized
-    user32.keybd_event(VK_MENU, 0, 0, 0)             # lets us take the foreground
-    user32.keybd_event(VK_MENU, 0, 2, 0)
-    user32.SetForegroundWindow(hwnd)
-    time.sleep(0.8)
-    for vk, hold in keys:
-        _tap_focus(vk, hold)
-    if prev and prev != hwnd:
-        user32.SetForegroundWindow(prev)             # give the PC back to the user
-
-
-# ---------------------------------------------------------------- Lock state
-class Lock:
-    def __init__(self, owner_id, target, place_id, job_id):
-        self.owner_id = owner_id
-        self.target = target
-        self.place_id = place_id
-        self.job_id = job_id
-        self.started = time.time()
-        self.next_move = time.time() + MOVE_INTERVAL
-        self.clients = []          # dicts: name, roblox, cookie, proc, hwnd, restarts, last_move, status
-        self.task = None
-
-
-lock_state = None                 # the active Lock or None
-
-
-def start_one(client, place_id, job_id):
-    """Blocking: launch one alt and wait for its window. Returns True on success."""
-    try:
-        proc = launch_client(client["cookie"], place_id, job_id)
-    except Exception as e:
-        client["status"] = f"launch failed: {e}"
-        client["proc"] = None
-        return False
-    client["proc"] = proc
-    hwnd = wait_for_window(proc)
-    client["hwnd"] = hwnd
-    if hwnd:
-        client["status"] = "in game"
-        client["last_move"] = time.time()
+def is_owner(interaction: discord.Interaction) -> bool:
+    if OWNER_ID and interaction.user.id == OWNER_ID:
         return True
-    client["status"] = "window never appeared" if proc.poll() is None else "client closed on start"
+    return bool(interaction.guild and interaction.guild.owner_id == interaction.user.id)
+
+
+async def require_owner(interaction: discord.Interaction) -> bool:
+    if is_owner(interaction):
+        return True
+    await interaction.response.send_message(
+        embed=embed("Not authorized", "Only the configured bot owner or server owner can use this command.", "err"),
+        ephemeral=True,
+    )
     return False
 
 
-def start_all(clients, place_id, job_id):
-    """Blocking: launch alts one by one."""
-    ok = 0
-    for i, c in enumerate(clients):
-        if i:
-            time.sleep(LAUNCH_DELAY)
-        if start_one(c, place_id, job_id):
-            ok += 1
-    return ok
-
-
-def move_all(clients):
-    for c in clients:
-        proc = c.get("proc")
-        if not proc or proc.poll() is not None:
-            continue
-        hwnd = c.get("hwnd")
-        if not hwnd or not user32.IsWindow(hwnd):
-            w = windows_for_pid(proc.pid)
-            hwnd = w[0] if w else None
-            c["hwnd"] = hwnd
-        if not hwnd:
-            continue
+async def send_log(guild: discord.Guild, title: str, description: str, *, view=None) -> Optional[discord.Message]:
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        gdata = load_data()["guilds"].get(str(guild.id), {})
+        channel = guild.get_channel(int(gdata.get("log_channel_id", 0) or 0))
+    if isinstance(channel, discord.TextChannel):
         try:
-            move_window(hwnd)
-            c["last_move"] = time.time()
-        except Exception as e:
-            c["status"] = f"move failed: {e}"
-        time.sleep(1)
+            return await channel.send(embed=embed(title, description, "neutral"), view=view)
+        except discord.HTTPException:
+            return None
+    return None
 
 
-def stop_all(lock):
-    for c in lock.clients:
-        kill_proc(c.get("proc"))
-        c["proc"] = None
-        c["status"] = "closed"
+def get_ticket(data: dict, channel_id: int) -> Optional[dict]:
+    return data["tickets"].get(str(channel_id))
 
 
-async def monitor_loop(lock):
-    """Keeps alts alive: relaunches crashed clients and moves everyone every MOVE_INTERVAL."""
-    while lock_state is lock:
-        await asyncio.sleep(MONITOR_TICK)
-        if lock_state is not lock:
-            break
-        for c in lock.clients:
-            proc = c.get("proc")
-            dead = proc is None or proc.poll() is not None
-            if dead and c["restarts"] < MAX_RESTARTS and c.get("status") != "closed":
-                c["restarts"] += 1
-                c["status"] = f"relaunching (try {c['restarts']}/{MAX_RESTARTS})"
-                await asyncio.to_thread(start_one, c, lock.place_id, lock.job_id)
-                await asyncio.sleep(LAUNCH_DELAY)
-            elif dead:
-                c["status"] = "dead (out of retries)"
-        if lock_state is lock and time.time() >= lock.next_move:
-            await asyncio.to_thread(move_all, lock.clients)
-            lock.next_move = time.time() + MOVE_INTERVAL
+async def update_ticket_message(channel: discord.TextChannel, ticket: dict) -> None:
+    message_id = ticket.get("panel_message_id")
+    if not message_id:
+        return
+    try:
+        msg = await channel.fetch_message(int(message_id))
+        await msg.edit(embed=ticket_embed(ticket), view=TicketView())
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
 
 
-def fmt_dur(sec):
-    sec = int(max(0, sec))
-    h, rem = divmod(sec, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}h {m}m" if h else f"{m}m {s}s"
+def ticket_embed(ticket: dict) -> discord.Embed:
+    lines = [
+        f"**Ticket:** Pos-Locking #{ticket['number']}",
+        f"**Requested by:** <@{ticket['user_id']}>",
+        f"**Status:** {ticket.get('status', 'Open')}",
+        f"**Created:** <t:{int(ticket.get('created_at', time.time()))}:R>",
+        "",
+        "**Selected profile records**",
+    ]
+    alts = ticket.get("alts", [])
+    if alts:
+        for a in alts[:20]:
+            status = a.get("status", "Not reviewed")
+            link = f"[{discord.utils.escape_markdown(a.get('name', 'Account'))}]({a['profile_url']})" if a.get("profile_url") else discord.utils.escape_markdown(a.get("name", "Account"))
+            lines.append(f"• {link} — **{status}**")
+        if len(alts) > 20:
+            lines.append(f"…and {len(alts) - 20} more.")
+    else:
+        lines.append("No profiles selected.")
+    if ticket.get("server_url"):
+        lines.extend(["", f"[Open supplied server link]({ticket['server_url']})"])
+    e = embed("Position Management Ticket", "\n".join(lines), "neutral")
+    e.set_footer(text="This panel records requests; it does not automate Roblox clients.")
+    return e
 
 
-# ---------------------------------------------------------------- Verify View
-class VerifyView(discord.ui.View):
+class ProfileSelect(discord.ui.Select):
+    def __init__(self, alts: list[dict], selected: set[str]):
+        options = []
+        for a in alts[:25]:
+            options.append(discord.SelectOption(
+                label=a["name"][:100],
+                value=a["key"][:100],
+                description=(f"@{a.get('username')}" if a.get("username") else "Roblox profile")[:100],
+                default=a["key"] in selected,
+            ))
+        super().__init__(
+            placeholder="Select profile records for this request",
+            min_values=0,
+            max_values=max(1, len(options)),
+            options=options,
+            custom_id="pos:profile_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "RequestView" = self.view  # type: ignore
+        view.selected = set(self.values)
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send(
+            f"Selected **{len(view.selected)}** profile record(s). Press **Create Ticket** when ready.",
+            ephemeral=True,
+        )
+
+
+class RequestView(discord.ui.View):
+    def __init__(self, alts: list[dict]):
+        super().__init__(timeout=300)
+        self.alts = alts
+        self.selected: set[str] = set()
+        self.add_item(ProfileSelect(alts, self.selected) if alts else EmptySelect())
+
+    @discord.ui.button(label="Create Ticket", style=discord.ButtonStyle.primary, custom_id="pos:create_ticket")
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        data = load_data()
+        gdata = data["guilds"].get(str(interaction.guild.id), {})
+        category_id = int(gdata.get("ticket_category_id", TICKET_CATEGORY_ID) or TICKET_CATEGORY_ID)
+        category = interaction.guild.get_channel(category_id)
+        if not isinstance(category, discord.CategoryChannel):
+            return await interaction.followup.send(
+                "The ticket category was not found. Ask the server owner to run `/authorize` and check the category ID.",
+                ephemeral=True,
+            )
+        number = int(data["next_ticket"].get(str(interaction.guild.id), 0)) + 1
+        data["next_ticket"][str(interaction.guild.id)] = number
+        chosen = [a.copy() for a in self.alts if a["key"] in self.selected]
+        for a in chosen:
+            a["status"] = "Not reviewed"
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        }
+        me = interaction.guild.me
+        if me:
+            overwrites[me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
+        # Let server staff with Manage Channels view and handle tickets.
+        for role in interaction.guild.roles:
+            if role.permissions.manage_channels or role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        channel = await interaction.guild.create_text_channel(
+            name=f"pos-locking-{number}",
+            category=category,
+            overwrites=overwrites,
+            topic=f"Position-management ticket #{number}; requester={interaction.user.id}",
+            reason=f"Position management ticket requested by {interaction.user}",
+        )
+        ticket = {
+            "guild_id": interaction.guild.id,
+            "channel_id": channel.id,
+            "number": number,
+            "user_id": interaction.user.id,
+            "status": "Open",
+            "created_at": int(time.time()),
+            "alts": chosen,
+            "server_url": "",
+            "review": None,
+            "panel_message_id": None,
+            "log_message_id": None,
+        }
+        data["tickets"][str(channel.id)] = ticket
+        save_data(data)
+        msg = await channel.send(
+            content=f"<@{interaction.user.id}>",
+            embed=ticket_embed(ticket),
+            view=TicketView(),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        ticket["panel_message_id"] = msg.id
+        data["tickets"][str(channel.id)] = ticket
+        save_data(data)
+        await send_log(interaction.guild, f"Ticket opened · Pos-Locking #{number}",
+                       f"Channel: {channel.mention}\nRequester: {interaction.user.mention}\nProfile records: {len(chosen)}")
+        await interaction.followup.send(f"Your ticket is ready: {channel.mention}", ephemeral=True)
+
+
+class EmptySelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder="No profiles found in alts.json", min_values=0, max_values=1,
+                         options=[discord.SelectOption(label="No profiles configured", value="none")], disabled=True)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+
+class ReviewView(discord.ui.View):
+    def __init__(self, ticket_channel_id: int):
+        super().__init__(timeout=86400)
+        self.ticket_channel_id = ticket_channel_id
+
+    @discord.ui.button(label="Positive", style=discord.ButtonStyle.success)
+    async def positive(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.finish(interaction, "Positive")
+
+    @discord.ui.button(label="Neutral", style=discord.ButtonStyle.secondary)
+    async def neutral(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.finish(interaction, "Neutral")
+
+    @discord.ui.button(label="Needs improvement", style=discord.ButtonStyle.danger)
+    async def negative(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.finish(interaction, "Needs improvement")
+
+    async def finish(self, interaction: discord.Interaction, rating: str):
+        data = load_data()
+        ticket = data["tickets"].get(str(self.ticket_channel_id))
+        if not ticket:
+            return await interaction.response.send_message("Ticket record not found.", ephemeral=True)
+        if interaction.user.id != int(ticket["user_id"]) and not is_owner(interaction):
+            return await interaction.response.send_message("Only the requester or bot owner can submit this review.", ephemeral=True)
+        ticket["review"] = {"rating": rating, "user_id": interaction.user.id, "at": int(time.time())}
+        data["tickets"][str(self.ticket_channel_id)] = ticket
+        save_data(data)
+        await interaction.response.send_message(f"Review recorded: **{rating}**. Thank you.", ephemeral=True)
+        if interaction.guild:
+            await send_log(interaction.guild, f"Review · Pos-Locking #{ticket['number']}",
+                           f"Rating: **{rating}**\nTicket: <#{self.ticket_channel_id}>\nReviewer: <@{interaction.user.id}>")
+
+
+class TicketView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Verify", style=discord.ButtonStyle.success, custom_id="pos:verify")
-    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        data = load_links()
-        me = str(interaction.user.id)
-        pend = data["pending"].get(me)
-        if not pend:
-            return await interaction.followup.send(
-                embed=em("Nothing to verify", "Run /pos link with your Roblox username first.", "warn"),
-                ephemeral=True)
-        try:
-            desc = await asyncio.to_thread(get_description, pend["id"])
-        except Exception as e:
-            return await interaction.followup.send(embed=em("Check failed", str(e), "err"), ephemeral=True)
+    async def ticket_context(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message("This control must be used in a ticket.", ephemeral=True)
+            return None, None
+        data = load_data()
+        ticket = get_ticket(data, interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message("Ticket record not found.", ephemeral=True)
+            return None, None
+        return data, ticket
 
-        if pend["code"].lower().strip() not in desc.lower():
-            return await interaction.followup.send(
-                embed=em("Code not found",
-                         f"I can't see `{pend['code']}` in the About section of {pend['name']} yet. "
-                         "Save your profile, wait a few seconds, then press Verify again.", "warn"),
-                ephemeral=True)
-
-        data["linked"][me] = {"id": pend["id"], "name": pend["name"]}
-        data["pending"].pop(me, None)
-        save_links(data)
-        await interaction.followup.send(
-            embed=em("Account linked",
-                     f"Successfully linked to **{pend['name']}**! You can remove the phrase from your profile now.\n"
-                     "Join your server, then run `/pos lock`", "ok"),
-            ephemeral=True)
-
-
-# ---------------------------------------------------------------- Command Group
-class PosGroup(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="pos", description="POS locker controls")
-
-    @app_commands.command(name="link", description="Link your Roblox account")
-    @app_commands.describe(username="Your Roblox username (leave empty to see current link)")
-    async def link_cmd(self, interaction: discord.Interaction, username: str = None):
-        await interaction.response.defer(ephemeral=True)
-        data = load_links()
-        me = str(interaction.user.id)
-
-        if not username:
-            cur = data["linked"].get(me)
-            if cur:
-                return await interaction.followup.send(
-                    embed=em("Linked account", f"You are linked to {cur['name']}.", "ok"), ephemeral=True)
-            return await interaction.followup.send(
-                embed=em("Not linked", "Run /pos link with your Roblox username.", "warn"), ephemeral=True)
-
-        try:
-            uid, name = await asyncio.to_thread(user_id_from_name, username)
-        except Exception as e:
-            return await interaction.followup.send(embed=em("Link failed", str(e), "err"), ephemeral=True)
-
-        w1, w2 = random.sample(VERIFY_WORDS, 2)
-        code = f"verify {w1} {w2}"
-        data["pending"][me] = {"id": uid, "name": name, "code": code}
-        save_links(data)
-
-        await interaction.followup.send(
-            embed=em(f"Verify {name}",
-                     "Put this exact phrase anywhere in your Roblox profile About section, save it, "
-                     f"then press **Verify** below.\n\n```{code}```", "info"),
-            view=VerifyView(), ephemeral=True)
-
-    @app_commands.command(name="lock", description="Send your alts into the server you are in")
-    @app_commands.describe(count="How many alts to send (default: all in alts.json)")
-    async def lock(self, interaction: discord.Interaction, count: app_commands.Range[int, 1, 100] = 100):
-        global lock_state
-        await interaction.response.defer()
-
-        if not IS_WINDOWS:
-            return await interaction.followup.send(embed=em(
-                "Windows only", "Launching Roblox clients only works when the bot runs on a Windows PC.", "err"))
-
-        linked = load_links()["linked"].get(str(interaction.user.id))
-        if not linked:
-            return await interaction.followup.send(
-                embed=em("No account linked", "Run `/pos link` with your Roblox username first.", "err"))
-
-        if lock_state is not None:
-            return await interaction.followup.send(embed=em(
-                "Lock already running",
-                f"A lock for **{lock_state.target}** is active. Run `/pos stop` first.", "warn"))
-
-        if not find_roblox_exe():
-            return await interaction.followup.send(embed=em(
-                "Roblox not found",
-                "Install Roblox from roblox.com on the PC running this bot (not the Microsoft Store version), "
-                "or set ROBLOX_EXE in .env.", "err"))
-
-                # Best effort: close stray Roblox on the bot PC, then try to grab the mutex
-        if not enable_multi_instance():
-            await asyncio.to_thread(close_all_roblox)
-            await asyncio.sleep(3)
-            enable_multi_instance()
-
-        try:
-            alts = load_alts()
-        except Exception as e:
-            return await interaction.followup.send(embed=em("Cannot read alts.json", str(e), "err"))
-        if not alts:
-            return await interaction.followup.send(embed=em("No alts", "alts.json is empty.", "err"))
-        alts = alts[:count]
-
-        # validate cookies first so we only launch working alts
-        async def verify_alt(a):
-            try:
-                _, rname = await asyncio.to_thread(whoami, a["cookie"])
-                return {"name": a["name"], "roblox": rname, "cookie": a["cookie"], "proc": None,
-                        "hwnd": None, "restarts": 0, "last_move": 0, "status": "queued"}, None
-            except Exception as e:
-                return None, f"{a['name']}: {e}"
-
-        results = await asyncio.gather(*(verify_alt(a) for a in alts))
-        clients = [c for c, _ in results if c]
-        bad = [err for _, err in results if err]
-        if not clients:
-            return await interaction.followup.send(embed=em(
-                "No working alts", "\n".join(bad)[:3900] or "All cookies were rejected.", "err"))
-
-        # find the requester's server (they are already in it)
-        try:
-            place_id, job_id = await asyncio.to_thread(
-                locate_user, [c["cookie"] for c in clients], linked["id"], linked["name"])
-        except Exception as e:
-            return await interaction.followup.send(embed=em("Server not found", str(e), "err"))
-
-        new_lock = Lock(interaction.user.id, linked["name"], place_id, job_id)
-        new_lock.clients = clients
-        lock_state = new_lock
-
-        await interaction.followup.send(embed=em(
-            "Server found - launching alts",
-            f"Locking **{linked['name']}**'s server with {len(clients)} alt(s). "
-            "This takes about a minute per alt, I will post when it finishes.", "info"))
-
-        ok = await asyncio.to_thread(start_all, clients, place_id, job_id)
-
-        if lock_state is not new_lock:           # /pos stop was used while launching
-            stop_all(new_lock)
+    @discord.ui.button(label="End", style=discord.ButtonStyle.success, custom_id="pos:ticket_end", row=0)
+    async def end_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data, ticket = await self.ticket_context(interaction)
+        if not ticket:
             return
-        if ok == 0:
-            stop_all(new_lock)
-            lock_state = None
-            lines = "\n".join(f"{c['name']}: {c['status']}" for c in clients)
-            return await interaction.channel.send(embed=em(
-                "Lock failed", f"No alt could join.\n{lines}"[:3900], "err"))
+        if interaction.user.id != int(ticket["user_id"]) and not is_owner(interaction):
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and (perms.manage_channels or perms.administrator)):
+                return await interaction.response.send_message("Only the requester or staff can end this ticket.", ephemeral=True)
+        ticket["status"] = "Ended"
+        ticket["ended_at"] = int(time.time())
+        data["tickets"][str(interaction.channel.id)] = ticket
+        save_data(data)
+        await interaction.response.send_message("Ticket ended. Please leave a review below.", view=ReviewView(interaction.channel.id))
+        await send_log(interaction.guild, f"Ticket ended · Pos-Locking #{ticket['number']}",
+                       f"Ticket: {interaction.channel.mention}\nEnded by: {interaction.user.mention}",
+                       view=LogTicketView(interaction.channel.id))
 
-        new_lock.next_move = time.time() + MOVE_INTERVAL
-        new_lock.task = asyncio.create_task(monitor_loop(new_lock))
+    @discord.ui.button(label="Join Server", style=discord.ButtonStyle.link, url="https://www.roblox.com/games/")
+    async def join_server_placeholder(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Link buttons do not dispatch callbacks. The static destination is a safe Roblox landing page.
+        pass
 
-        lines = [f"[{'OK' if c['status'] == 'in game' else 'FAIL'}] {c['name']} ({c['roblox']}) - {c['status']}"
-                 for c in clients] + [f"[SKIPPED] {b}" for b in bad]
-        await interaction.channel.send(embed=em(
-            "Position lock active", "\n".join(lines)[:3900], "ok",
-            [("Target", linked["name"], True),
-             ("Alts in server", f"{ok} / {len(clients)}", True),
-             ("Move interval", f"{int(MOVE_INTERVAL // 60)} min", True),
-             ("Job / Server ID", f"`{job_id}`", False)]))
+    @discord.ui.button(label="Log Profile", style=discord.ButtonStyle.secondary, custom_id="pos:ticket_log_profile", row=1)
+    async def log_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data, ticket = await self.ticket_context(interaction)
+        if not ticket:
+            return
+        if interaction.user.id != int(ticket["user_id"]) and not is_owner(interaction):
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and (perms.manage_channels or perms.administrator)):
+                return await interaction.response.send_message("Only the requester or staff can update this ticket.", ephemeral=True)
+        pending = [a for a in ticket.get("alts", []) if a.get("status") != "Logged"]
+        if not pending:
+            return await interaction.response.send_message("All profile records are already logged.", ephemeral=True)
+        target = pending[0]
+        target["status"] = "Logged"
+        target["logged_at"] = int(time.time())
+        target["logged_by"] = interaction.user.id
+        data["tickets"][str(interaction.channel.id)] = ticket
+        save_data(data)
+        await interaction.response.edit_message(embed=ticket_embed(ticket), view=self)
+        await send_log(interaction.guild, f"Profile logged · Pos-Locking #{ticket['number']}",
+                       f"Profile: **{target['name']}**\nTicket: {interaction.channel.mention}\nUpdated by: {interaction.user.mention}")
 
-    @app_commands.command(name="stats", description="Show the active position lock")
-    async def stats(self, interaction: discord.Interaction):
-        lk = lock_state
-        if lk is None:
-            return await interaction.response.send_message(
-                embed=em("Idle", "No position lock is running.", "info"))
-        lines = []
-        for c in lk.clients:
-            alive = c["proc"] is not None and c["proc"].poll() is None
-            moved = f"moved {fmt_dur(time.time() - c['last_move'])} ago" if c["last_move"] else "not moved yet"
-            lines.append(f"[{'UP' if alive else 'DOWN'}] {c['name']} ({c['roblox']}) - {c['status']}, {moved}, "
-                         f"restarts {c['restarts']}")
-        up = sum(1 for c in lk.clients if c["proc"] is not None and c["proc"].poll() is None)
-        await interaction.response.send_message(embed=em(
-            "Position lock active", "\n".join(lines)[:3900], "ok",
-            [("Target", lk.target, True),
-             ("Requested by", f"<@{lk.owner_id}>", True),
-             ("Alts up", f"{up} / {len(lk.clients)}", True),
-             ("Running for", fmt_dur(time.time() - lk.started), True),
-             ("Next move in", fmt_dur(lk.next_move - time.time()), True),
-             ("Job / Server ID", f"`{lk.job_id}`", False)]))
-
-    @app_commands.command(name="stop", description="End the position lock and close the alts")
-    async def stop(self, interaction: discord.Interaction):
-        global lock_state
-        lk = lock_state
-        if lk is None:
-            return await interaction.response.send_message(
-                embed=em("Idle", "No position lock is running.", "info"), ephemeral=True)
-        perms = getattr(interaction.user, "guild_permissions", None)
-        if interaction.user.id != lk.owner_id and not (perms and perms.manage_guild):
-            return await interaction.response.send_message(embed=em(
-                "Not allowed", "Only the person who started the lock or a server manager can stop it.", "err"),
-                ephemeral=True)
-        await interaction.response.defer()
-        lock_state = None
-        if lk.task:
-            lk.task.cancel()
-        await asyncio.to_thread(stop_all, lk)
-        await interaction.followup.send(embed=em(
-            "Position lock ended",
-            f"Closed {len(lk.clients)} alt client(s). Ran for {fmt_dur(time.time() - lk.started)}.", "ok"))
-
-    @app_commands.command(name="check", description="Test every cookie in alts.json")
-    async def check(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, custom_id="pos:ticket_delete", row=1)
+    async def delete_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data, ticket = await self.ticket_context(interaction)
+        if not ticket:
+            return
+        if not is_owner(interaction):
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and (perms.manage_channels or perms.administrator)):
+                return await interaction.response.send_message("Only the bot owner or server staff can delete a ticket.", ephemeral=True)
+        ticket["status"] = "Deleted"
+        ticket["deleted_at"] = int(time.time())
+        data["tickets"][str(interaction.channel.id)] = ticket
+        save_data(data)
+        await interaction.response.send_message("Ticket record saved. Deleting this channel in 5 seconds.")
+        await send_log(interaction.guild, f"Ticket deleted · Pos-Locking #{ticket['number']}",
+                       f"Ticket channel: `{interaction.channel.name}`\nDeleted by: {interaction.user.mention}",
+                       view=LogTicketView(interaction.channel.id))
+        await asyncio.sleep(5)
         try:
-            alts = load_alts()
-        except Exception as e:
-            return await interaction.followup.send(embed=em("Cannot read alts.json", str(e), "err"), ephemeral=True)
-
-        sem = asyncio.Semaphore(API_PARALLEL)
-
-        async def test(alt):
-            async with sem:
-                try:
-                    _, name = await asyncio.to_thread(whoami, alt["cookie"])
-                    return True, f"[OK] {alt['name']} - {name}"
-                except Exception as e:
-                    return False, f"[FAIL] {alt['name']} - {e}"
-
-        res = await asyncio.gather(*(test(a) for a in alts))
-        good = sum(1 for ok, _ in res if ok)
-        await interaction.followup.send(
-            embed=em("Cookie check", "\n".join(t for _, t in res)[:3900],
-                     "ok" if good == len(res) else "warn", [("Working", f"{good} / {len(res)}", True)]),
-            ephemeral=True)
+            await interaction.channel.delete(reason=f"Ticket deleted by {interaction.user}")
+        except discord.HTTPException:
+            pass
 
 
-class Bot(discord.Client):
+class LogTicketView(discord.ui.View):
+    def __init__(self, ticket_channel_id: int):
+        super().__init__(timeout=None)
+        self.ticket_channel_id = ticket_channel_id
+
+    @discord.ui.button(label="View Record", style=discord.ButtonStyle.secondary)
+    async def view_record(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        ticket = data["tickets"].get(str(self.ticket_channel_id))
+        if not ticket:
+            return await interaction.response.send_message("No saved ticket record.", ephemeral=True)
+        if not is_owner(interaction):
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and (perms.manage_channels or perms.administrator)):
+                return await interaction.response.send_message("Staff only.", ephemeral=True)
+        e = ticket_embed(ticket)
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @discord.ui.button(label="Reopen", style=discord.ButtonStyle.primary)
+    async def reopen(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        ticket = data["tickets"].get(str(self.ticket_channel_id))
+        if not ticket:
+            return await interaction.response.send_message("No saved ticket record.", ephemeral=True)
+        if not is_owner(interaction):
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and (perms.manage_channels or perms.administrator)):
+                return await interaction.response.send_message("Staff only.", ephemeral=True)
+        if not interaction.guild:
+            return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        channel = interaction.guild.get_channel(self.ticket_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message(
+                "The original ticket channel was deleted. The record is preserved, but this version does not recreate deleted tickets.",
+                ephemeral=True,
+            )
+        ticket["status"] = "Open"
+        ticket.pop("ended_at", None)
+        data["tickets"][str(self.ticket_channel_id)] = ticket
+        save_data(data)
+        await channel.set_permissions(interaction.guild.default_role, view_channel=False)
+        member = interaction.guild.get_member(int(ticket["user_id"]))
+        if member:
+            await channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+        await update_ticket_message(channel, ticket)
+        await interaction.response.send_message(f"Reopened {channel.mention}.", ephemeral=True)
+        await send_log(interaction.guild, f"Ticket reopened · Pos-Locking #{ticket['number']}",
+                       f"Ticket: {channel.mention}\nReopened by: {interaction.user.mention}")
+
+
+class MainPanelView(discord.ui.View):
     def __init__(self):
-        super().__init__(intents=discord.Intents.default())
-        self.tree = app_commands.CommandTree(self)
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Check Available Alts", style=discord.ButtonStyle.secondary, custom_id="pos:check_alts", row=0)
+    async def check_alts(self, interaction: discord.Interaction, button: discord.ui.Button):
+        alts = load_alts()
+        if not alts:
+            return await interaction.response.send_message(
+                embed=embed("No profiles configured", "Add display-safe profile metadata to `alts.json` and redeploy.", "warn"),
+                ephemeral=True,
+            )
+        lines = []
+        for a in alts[:30]:
+            name = discord.utils.escape_markdown(a["name"])
+            lines.append(f"• [{name}]({a['profile_url']})" if a["profile_url"] else f"• {name} — profile link unavailable")
+        if len(alts) > 30:
+            lines.append(f"…and {len(alts) - 30} more.")
+        await interaction.response.send_message(
+            embed=embed(f"Registered Profiles · {len(alts)}", "\n".join(lines), "info"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Create Request", style=discord.ButtonStyle.primary, custom_id="pos:create_request", row=0)
+    async def create_request(self, interaction: discord.Interaction, button: discord.ui.Button):
+        alts = load_alts()
+        if not alts:
+            return await interaction.response.send_message(
+                embed=embed("No profiles configured", "There are no profile records in `alts.json` yet.", "warn"),
+                ephemeral=True,
+            )
+        view = RequestView(alts)
+        await interaction.response.send_message(
+            embed=embed("Create Position Request",
+                        "Select the profile records you want listed in your private ticket, then press **Create Ticket**.\n\n"
+                        "This creates a tracking ticket only; it does not launch Roblox clients or join a game server.",
+                        "info"),
+            view=view,
+            ephemeral=True,
+        )
+
+
+class ReadMeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Open Position Panel", style=discord.ButtonStyle.primary, custom_id="pos:open_panel")
+    async def open_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_data()
+        gdata = data["guilds"].get(str(interaction.guild_id), {}) if interaction.guild_id else {}
+        channel_id = int(gdata.get("panel_channel_id", PANEL_CHANNEL_ID) or PANEL_CHANNEL_ID)
+        channel = interaction.guild.get_channel(channel_id) if interaction.guild else None
+        if isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(f"Use the position panel in {channel.mention}.", ephemeral=True)
+        else:
+            await interaction.response.send_message("The position panel has not been configured by the server owner.", ephemeral=True)
+
+
+async def ensure_readme(guild: discord.Guild):
+    existing = discord.utils.get(guild.text_channels, name="read-me")
+    if existing:
+        return existing
+    try:
+        channel = await guild.create_text_channel(
+            "read-me",
+            position=0,
+            topic="Read this before using the position management bot.",
+            reason="Create bot information channel",
+        )
+        e = embed("Welcome to Position Management",
+                  "This bot helps organize profile records and position-related requests.\n\n"
+                  "• Use the position panel to review registered Roblox profiles.\n"
+                  "• Create a private ticket to track a request.\n"
+                  "• End tickets and leave a review when finished.\n"
+                  "• Staff can review saved records in the log channel.\n\n"
+                  "This bot does not automatically join Roblox servers or launch Roblox clients.",
+                  "neutral")
+        await channel.send(embed=e, view=ReadMeView())
+        data = load_data()
+        data["created_channels"].setdefault(str(guild.id), [])
+        data["created_channels"][str(guild.id)].append(channel.id)
+        save_data(data)
+        return channel
+    except discord.HTTPException:
+        return None
+
+
+class PositionBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        self.add_view(VerifyView())
-        self.tree.add_command(PosGroup())
-        if GUILD_ID:
-            g = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=g)
-            await self.tree.sync(guild=g)
-        else:
+        self.add_view(MainPanelView())
+        self.add_view(TicketView())
+        self.add_view(ReadMeView())
+        # Persistent views attached to old log messages are recreated when those messages are interacted with
+        try:
             await self.tree.sync()
-
-    async def close(self):
-        global lock_state
-        if lock_state is not None:
-            lk, lock_state = lock_state, None
-            if lk.task:
-                lk.task.cancel()
-            stop_all(lk)
-        await super().close()
+        except discord.HTTPException as exc:
+            print(f"Command sync warning: {exc}")
 
     async def on_ready(self):
-        print(f"Logged in as {self.user}")
-        if IS_WINDOWS:
-            print(f"Roblox client: {find_roblox_exe() or 'NOT FOUND'}")
-            if MUTEX_OWNED:
-                print("Multi-client lock: OK")
-            else:
-                print("Multi-client lock: waiting (Roblox is open on this PC). "
-                      "It is picked up automatically once that Roblox is closed.")
+        print(f"Logged in as {self.user} (ID: {self.user.id})")
+        print(f"Loaded {len(load_alts())} display-safe profile records.")
+        print("Bot is ready.")
+
+    async def on_guild_join(self, guild: discord.Guild):
+        await ensure_readme(guild)
+
+
+bot = PositionBot()
+
+
+@bot.tree.command(name="authorize", description="Owner-only: configure the position management panel and channels")
+@app_commands.guild_only()
+async def authorize(interaction: discord.Interaction):
+    if not await require_owner(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.followup.send("This command only works in a server.", ephemeral=True)
+
+    data = load_data()
+    # Prefer the supplied channel IDs, but gracefully report missing permissions/resources.
+    panel_channel = guild.get_channel(PANEL_CHANNEL_ID)
+    log_channel = guild.get_channel(LOG_CHANNEL_ID)
+    ticket_category = guild.get_channel(TICKET_CATEGORY_ID)
+    panel_category = guild.get_channel(PANEL_CATEGORY_ID)
+
+    # Create missing categories/channels and record which resources the bot created.
+    created = data["created_channels"].setdefault(str(guild.id), [])
+    if not isinstance(panel_category, discord.CategoryChannel):
+        panel_category = await guild.create_category("Position Management", reason="Position bot authorization")
+        created.append(panel_category.id)
+    if not isinstance(ticket_category, discord.CategoryChannel):
+        ticket_category = await guild.create_category("Position Tickets", reason="Position bot authorization")
+        created.append(ticket_category.id)
+    if not isinstance(panel_channel, discord.TextChannel):
+        panel_channel = await guild.create_text_channel("position-panel", category=panel_category,
+                                                        reason="Position bot authorization")
+        created.append(panel_channel.id)
+    if not isinstance(log_channel, discord.TextChannel):
+        log_channel = await guild.create_text_channel("position-logs", category=panel_category,
+                                                      reason="Position bot authorization")
+        created.append(log_channel.id)
+
+    data["guilds"][str(guild.id)] = {
+        "panel_channel_id": panel_channel.id,
+        "panel_category_id": panel_category.id,
+        "ticket_category_id": ticket_category.id,
+        "log_channel_id": log_channel.id,
+        "authorized_by": interaction.user.id,
+        "authorized_at": int(time.time()),
+    }
+    save_data(data)
+
+    e = embed("Position Management",
+              "**What is this?**\n"
+              "A central panel for viewing registered Roblox profiles and opening private request tickets.\n\n"
+              "**Benefits**\n"
+              "• Private tickets and saved history.\n"
+              "• Profile records and staff logs.\n"
+              "• Review and reopen supported tickets.\n\n"
+              "**Rules**\n"
+              "• Only use accounts you are authorized to manage.\n"
+              "• Never share Roblox session cookies or passwords.\n"
+              "• Profile status is recorded manually; the bot does not claim to launch clients.\n\n"
+              "**Create a request**\n"
+              "Choose **Check Available Alts** to review profile links or **Create Request** to open a ticket.",
+              "neutral")
+    await panel_channel.send(embed=e, view=MainPanelView())
+    await ensure_readme(guild)
+    await interaction.followup.send(
+        embed=embed("Authorization complete",
+                    f"Panel: {panel_channel.mention}\n"
+                    f"Ticket category: **{ticket_category.name}**\n"
+                    f"Logs: {log_channel.mention}\n"
+                    "The bot is configured. Existing channels were reused when their configured IDs were valid.",
+                    "ok"),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="deauthorize", description="Owner-only: remove bot-created channels and leave this server")
+@app_commands.guild_only()
+async def deauthorize(interaction: discord.Interaction):
+    if not await require_owner(interaction):
+        return
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+    await interaction.response.send_message(
+        embed=embed("Confirm deauthorization",
+                    "This removes channels tracked as created by this bot, then makes the bot leave this server. "
+                    "Existing channels that were merely reused will not be deleted.", "warn"),
+        view=DeauthorizeConfirmView(guild.id),
+        ephemeral=True,
+    )
+
+
+class DeauthorizeConfirmView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Confirm and leave", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_owner(interaction) or not interaction.guild or interaction.guild.id != self.guild_id:
+            return await interaction.response.send_message("Only the bot owner can confirm this action.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        data = load_data()
+        ids = data["created_channels"].get(str(self.guild_id), [])
+        deleted = 0
+        for channel_id in list(ids):
+            channel = interaction.guild.get_channel(int(channel_id))
+            if channel:
+                try:
+                    await channel.delete(reason="Bot deauthorized by owner")
+                    deleted += 1
+                except discord.HTTPException:
+                    pass
+        data["guilds"].pop(str(self.guild_id), None)
+        data["created_channels"].pop(str(self.guild_id), None)
+        save_data(data)
+        await interaction.followup.send(f"Removed {deleted} bot-created channel(s). Leaving the server now.", ephemeral=True)
+        await bot.close_guild(self.guild_id)
+
+
+async def close_guild(guild_id: int):
+    guild = bot.get_guild(guild_id)
+    if guild:
+        await guild.leave()
+
+
+# Attach method after class definition to keep the confirmation callback simple.
+PositionBot.close_guild = close_guild  # type: ignore[attr-defined]
+
+
+@bot.tree.command(name="test", description="Show all registered Roblox profiles and quick links")
+@app_commands.guild_only()
+async def test_profiles(interaction: discord.Interaction):
+    alts = load_alts()
+    if not alts:
+        return await interaction.response.send_message(
+            embed=embed("No profiles found", "Add public profile metadata to `alts.json` first.", "warn"),
+            ephemeral=True,
+        )
+    lines = []
+    for i, a in enumerate(alts[:40], 1):
+        name = discord.utils.escape_markdown(a["name"])
+        if a["profile_url"]:
+            lines.append(f"{i}. [{name}]({a['profile_url']})")
         else:
-            print("WARNING: not Windows - /pos lock cannot launch Roblox clients here.")
+            lines.append(f"{i}. {name} — no profile URL")
+    if len(alts) > 40:
+        lines.append(f"…and {len(alts) - 40} more.")
+    await interaction.response.send_message(
+        embed=embed(f"Registered Roblox Profiles ({len(alts)})",
+                    "\n".join(lines) + "\n\nSelect a link to open its Roblox profile. Discord cannot force a user's browser to open many tabs at once.",
+                    "info"),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="unlink", description="Remove your linked Roblox username from the bot's local link records")
+@app_commands.guild_only()
+async def unlink(interaction: discord.Interaction):
+    data = load_data()
+    links = data.setdefault("links", {})
+    removed = links.pop(str(interaction.user.id), None)
+    save_data(data)
+    if removed:
+        await interaction.response.send_message("Your saved link record has been removed.", ephemeral=True)
+    else:
+        await interaction.response.send_message("You do not have a saved link record in this version.", ephemeral=True)
+
+
+@bot.tree.command(name="ticket-record", description="Staff: view a saved ticket record by ticket channel ID")
+@app_commands.describe(channel_id="The original ticket channel ID")
+@app_commands.guild_only()
+async def ticket_record(interaction: discord.Interaction, channel_id: str):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not is_owner(interaction) and not (perms and (perms.manage_channels or perms.administrator)):
+        return await interaction.response.send_message("Staff only.", ephemeral=True)
+    if not channel_id.isdigit():
+        return await interaction.response.send_message("Enter a numeric channel ID.", ephemeral=True)
+    ticket = load_data()["tickets"].get(channel_id)
+    if not ticket or int(ticket.get("guild_id", 0)) != interaction.guild_id:
+        return await interaction.response.send_message("No saved ticket record for this server.", ephemeral=True)
+    await interaction.response.send_message(embed=ticket_embed(ticket), ephemeral=True)
+
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    # Keep records when ticket channels are deleted so staff can still inspect the history.
+    data = load_data()
+    ticket = data["tickets"].get(str(channel.id))
+    if ticket and ticket.get("status") != "Deleted":
+        ticket["status"] = "Channel deleted; record retained"
+        data["tickets"][str(channel.id)] = ticket
+        save_data(data)
 
 
 if __name__ == "__main__":
     if not TOKEN:
-        sys.exit("DISCORD_TOKEN missing in .env")
-    if IS_WINDOWS:
-        enable_multi_instance()
-    Bot().run(TOKEN)
+        sys.exit("Missing DISCORD_TOKEN environment variable.")
+    bot.run(TOKEN)
+'''
+path = Path("/mnt/data/main.py")
+path.write_text(code, encoding="utf-8")
+print(f"Created {path} ({len(code.splitlines())} lines).")
