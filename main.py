@@ -17,7 +17,7 @@ Bot environment (Railway variables or .env)
 
 Agent environment (.env next to main.py on the Windows PC)
   BOT_URL=https://your-app.up.railway.app      AGENT_KEY=<same secret>
-  (optional) ROBLOX_EXE, MOVE_INTERVAL_MIN, MOVE_MODE, LAUNCH_DELAY, CLOSE_HOST_ROBLOX=1
+  (optional) ROBLOX_EXE, MOVE_INTERVAL_MIN, MOVE_MODE, LAUNCH_DELAY, CLOSE_HOST_ROBLOX=1, ALTS_FILE
   alts.json -> [{"name": "alt1", "cookie": "_|WARNING..."}, ...]   (stays on the agent PC only)
 
 Pip:  pip install -U "discord.py>=2.6" requests python-dotenv aiohttp playwright
@@ -31,7 +31,6 @@ import hmac
 import json
 import os
 import random
-import re
 import subprocess
 import sys
 import time
@@ -98,6 +97,17 @@ if IS_WINDOWS:
     from ctypes import wintypes
     user32 = ctypes.windll.user32
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateEventW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
 
 
 def em(title, desc=None, kind="info", fields=None):
@@ -128,6 +138,7 @@ def http(method, url, retries=4, **kw):
         try:
             r = requests.request(method, url, **kw)
             if r.status_code == 429:
+                last_exc = None
                 time.sleep(2 ** i + random.random())
                 continue
             return r
@@ -159,10 +170,9 @@ def clean_cookie(c):
 
 
 def load_alts():
-    alts_path = os.path.join(BASE, "alts.json")
-    if not os.path.exists(alts_path):
+    if not os.path.exists(ALTS_FILE):
         return []
-    with open(alts_path, "r", encoding="utf-8") as f:
+    with open(ALTS_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     items = data.get("alts", data) if isinstance(data, dict) else data
     alts = []
@@ -266,8 +276,10 @@ def load_links():
 
 
 def save_links(data):
-    with open(LINKS_FILE, "w", encoding="utf-8") as f:
+    tmp = LINKS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp, LINKS_FILE)
 
 
 def load_db():
@@ -301,15 +313,13 @@ MUTEX_OWNED = False
 
 
 def enable_multi_instance():
-    """Own Roblox's singleton mutex so several clients can run side by side."""
+    """Own Roblox's singleton mutex so several clients can run side by side.
+    Must always be called from the main (event loop) thread so the mutex is never abandoned."""
     global _mutex_handle, _event_handle, MUTEX_OWNED
     if not IS_WINDOWS:
         return False
     if MUTEX_OWNED:
         return True
-    kernel32.CreateMutexW.restype = wintypes.HANDLE
-    kernel32.CreateEventW.restype = wintypes.HANDLE
-    kernel32.WaitForSingleObject.restype = wintypes.DWORD
     if _mutex_handle is None:
         _mutex_handle = kernel32.CreateMutexW(None, True, "ROBLOX_singletonMutex")
         err = ctypes.get_last_error()
@@ -330,16 +340,6 @@ def close_all_roblox():
                        capture_output=True, timeout=20)
     except Exception:
         pass
-
-
-def ensure_multi():
-    if enable_multi_instance():
-        return True
-    if CLOSE_HOST_ROBLOX:
-        close_all_roblox()
-        time.sleep(3)
-        return enable_multi_instance()
-    return False
 
 
 def find_roblox_exe():
@@ -648,6 +648,16 @@ class Agent:
             lock.task.cancel()
         await asyncio.to_thread(lambda: [kill_proc(c.get("proc")) for c in lock.clients.values()])
 
+    async def ensure_multi(self):
+        """Keeps the mutex creation on the event-loop thread (a mutex dies with the thread that owns it)."""
+        if enable_multi_instance():
+            return True
+        if CLOSE_HOST_ROBLOX:
+            await asyncio.to_thread(close_all_roblox)
+            await asyncio.sleep(3)
+            return enable_multi_instance()
+        return False
+
     # ---- commands
     async def c_ping(self, cmd):
         return {}
@@ -672,7 +682,7 @@ class Agent:
         tid = int(cmd["tid"])
         if tid in self.locks:
             await self.stop_lock(tid)
-        if not await asyncio.to_thread(ensure_multi):
+        if not await self.ensure_multi():
             raise AgentError("Roblox is already open on the agent PC. Close it (or set CLOSE_HOST_ROBLOX=1 "
                              "in the agent's .env) so multiple clients can run.", "mutex")
         clients = {}
@@ -774,9 +784,8 @@ class Agent:
         await self.refresh_alts()
         async with aiohttp.ClientSession() as s:
             while True:
-                body = {"alts": self.alt_info, "locks": self.snapshot(), "results": self.pending_results}
-                sent = self.pending_results
-                self.pending_results = []
+                sent, self.pending_results = self.pending_results, []
+                body = {"alts": self.alt_info, "locks": self.snapshot(), "results": sent}
                 try:
                     async with s.post(self.url, json=body, headers={"X-Agent-Key": self.key},
                                       timeout=aiohttp.ClientTimeout(total=20)) as r:
@@ -1002,6 +1011,7 @@ def _make_dyn(action, label, style):
             await ACTION_HANDLERS[action](interaction, self.tid)
 
     _Btn.__name__ = f"Dyn_{action}"
+    _Btn.__qualname__ = f"Dyn_{action}"
     DYN[action] = _Btn
 
 
@@ -1107,7 +1117,8 @@ async def end_ticket(rec, by=None):
     ch = bot.get_channel(rec["channel_id"]) if rec.get("channel_id") else None
     if ch is not None:
         try:
-            await ch.get_partial_message(rec["message_id"]).edit(embed=ticket_embed(rec), view=ticket_view(rec))
+            if rec.get("message_id"):
+                await ch.get_partial_message(rec["message_id"]).edit(embed=ticket_embed(rec), view=ticket_view(rec))
             await ch.send(embed=em("How was your lock?",
                                    "The lock has ended and the alts were closed. Rate this session, "
                                    "then press **Delete Ticket** on the message above when you are done.", "info"),
@@ -1131,9 +1142,11 @@ async def refresh_ticket(rec):
             bridge.send("deploy", tid=rec["id"], place_id=rec["place_id"], job_id=rec["job_id"], names=names)
             rec["last_deploy"] = time.time()
             save_db()
+    if not rec.get("message_id"):
+        return
     try:
         await ch.get_partial_message(rec["message_id"]).edit(embed=ticket_embed(rec), view=ticket_view(rec))
-    except discord.NotFound:
+    except (discord.NotFound, discord.Forbidden):
         pass
 
 
@@ -1249,7 +1262,7 @@ class LogoutView(discord.ui.View):
         super().__init__(timeout=180)
         self.rec = rec
         opts = [discord.SelectOption(label=a["name"][:100], value=a["name"],
-                                     description=(a["roblox"] or "")[:100]) for a in left[:25]]
+                                     description=((a["roblox"] or "")[:100] or None)) for a in left[:25]]
         self.sel = discord.ui.Select(placeholder="Choose alts to log out", min_values=1,
                                      max_values=len(opts), options=opts)
         self.sel.callback = self.done
@@ -1354,7 +1367,8 @@ class ConfigView(discord.ui.View):
 # ================================================================ BOT SIDE: deploy flow
 async def reply(interaction, embed, view=None, edit=False):
     if edit:
-        await interaction.edit_original_response(embed=embed, embeds=None, view=view)
+        # NOTE: never pass embeds=None together with embed= (discord.py raises TypeError)
+        await interaction.edit_original_response(embed=embed, view=view)
     else:
         kw = {"embed": embed, "ephemeral": True}
         if view is not None:
@@ -1462,6 +1476,7 @@ class ModeView(discord.ui.View):
 class ManualView(discord.ui.View):
     def __init__(self, avail):
         super().__init__(timeout=300)
+        self.chosen = []
         opts = [discord.SelectOption(label=(a["roblox"] or a["name"])[:100], value=a["name"],
                                      description=f"label: {a['name']}"[:100]) for a in avail[:25]]
         self.sel = discord.ui.Select(placeholder="Choose the alts to send", min_values=1,
@@ -1471,7 +1486,6 @@ class ManualView(discord.ui.View):
         go = discord.ui.Button(label="Deploy Selected", style=discord.ButtonStyle.success, emoji="🚀")
         go.callback = self.go
         self.add_item(go)
-        self.chosen = []
 
     async def on_select(self, interaction):
         self.chosen = list(self.sel.values)
@@ -1499,9 +1513,8 @@ async def deploy_flow(interaction, names, reopen=None):
     """interaction must already be deferred. Locates the server, launches the alts, opens the ticket."""
     guild = interaction.guild
 
-    async def fail(title, desc, view=None):
-        kw = {"embed": em(title, desc, "err"), "ephemeral": True}
-        await interaction.followup.send(**kw)
+    async def fail(title, desc):
+        await interaction.followup.send(embed=em(title, desc, "err"), ephemeral=True)
 
     cfg = guild_cfg(guild.id) if guild else None
     if not cfg or not cfg.get("authorized"):
@@ -1511,7 +1524,8 @@ async def deploy_flow(interaction, names, reopen=None):
         return await fail("Agent offline", AGENT_OFFLINE)
     for r in active_tickets():
         if r["owner_id"] == owner_id and (not reopen or r["id"] != reopen["id"]):
-            return await fail("Active lock found", f"Finish <#{r['channel_id']}> before starting another lock.")
+            where = f"<#{r['channel_id']}>" if r.get("channel_id") else f"ticket #{r['id']}"
+            return await fail("Active lock found", f"Finish {where} before starting another lock.")
     avail = {a["name"]: a for a in available_alts()}
     if not names or any(n not in avail for n in names):
         return await fail("Alts not available",
@@ -1576,8 +1590,20 @@ async def deploy_flow(interaction, names, reopen=None):
                    "ended_at": None, "final": {}, "review": None, "last_deploy": now}
             DB["tickets"][str(tid)] = rec
             DB["counter"] = max(DB["counter"], tid)
-        msg = await ch.send(content=member.mention if member else None,
-                            embed=ticket_embed(rec), view=ticket_view(rec))
+        try:
+            msg = await ch.send(content=member.mention if member else None,
+                                embed=ticket_embed(rec), view=ticket_view(rec))
+        except discord.HTTPException as e:
+            bridge.send("stop", tid=tid)
+            if not reopen:
+                DB["tickets"].pop(str(tid), None)
+            if new_channel is not None:
+                try:
+                    await new_channel.delete(reason="Ticket message failed")
+                except discord.HTTPException:
+                    pass
+            save_db()
+            return await fail("Could not post the ticket", str(e))
         rec["message_id"] = msg.id
         save_db()
         await update_log(rec)
@@ -1722,6 +1748,13 @@ class PanelMenuRow(discord.ui.ActionRow):
                 await show_roster(interaction)
             else:
                 await deploy_entry(interaction)
+        except Exception as e:
+            print(f"[bot] panel menu error: {type(e).__name__}: {e}")
+            try:
+                await interaction.followup.send(embed=em("Something went wrong", str(e)[:300], "err"),
+                                                ephemeral=True)
+            except Exception:
+                pass
         finally:
             try:
                 await interaction.message.edit(view=self.view)      # resets the menu selection
@@ -1813,7 +1846,8 @@ async def health(request):
 
 
 async def agent_poll(request):
-    if not AGENT_KEY or not hmac.compare_digest(request.headers.get("X-Agent-Key", ""), AGENT_KEY):
+    given = request.headers.get("X-Agent-Key", "")
+    if not AGENT_KEY or not hmac.compare_digest(given.encode("utf-8"), AGENT_KEY.encode("utf-8")):
         return web.json_response({"error": "unauthorized"}, status=401)
     try:
         body = await request.json()
@@ -1825,11 +1859,15 @@ async def agent_poll(request):
     for r in body.get("results", []):
         bridge.resolve(r)
     for key in list(bridge.locks):                 # kill locks the bot no longer wants
-        rec = DB["tickets"].get(key)
-        if int(key) in PENDING:
+        try:
+            tid = int(key)
+        except ValueError:
             continue
+        if tid in PENDING:
+            continue
+        rec = DB["tickets"].get(key)
         if not rec or rec["status"] != "active":
-            bridge.send("stop", tid=int(key))
+            bridge.send("stop", tid=tid)
     cmds, bridge.commands = bridge.commands, []
     return web.json_response({"commands": cmds})
 
@@ -1996,7 +2034,12 @@ async def authorize_cmd(interaction: discord.Interaction):
         return await interaction.followup.send(embed=em(
             "Missing permissions", "I need **Manage Channels**, **Manage Roles**, **Send Messages** and "
                                    "**Embed Links** (Administrator is easiest).", "err"), ephemeral=True)
-    tag = lambda made: "created" if made else "existing"
+    except discord.HTTPException as e:
+        return await interaction.followup.send(embed=em("Authorize failed", str(e)[:500], "err"), ephemeral=True)
+
+    def tag(made):
+        return "created" if made else "existing"
+
     await interaction.followup.send(embed=em(
         "Authorized", "The panel is live.", "ok",
         [("Panel", f"{pch.mention} ({tag(c2)})", False), ("Logs", f"{lch.mention} ({tag(c3)}, private)", False),
@@ -2049,8 +2092,10 @@ async def stats_cmd(interaction: discord.Interaction):
     lines = []
     for r in act:
         up = sum(1 for x in alt_rows(r) if x["status"] == "in game")
-        lines.append(f"**#{r['id']}** - {r['roblox']} - {up}/{len(r['alts'])} alts up - "
-                     f"<#{r['channel_id']}>" if r.get("channel_id") else f"**#{r['id']}** - {r['roblox']}")
+        line = f"**#{r['id']}** - {r['roblox']} - {up}/{len(r['alts'])} alts up"
+        if r.get("channel_id"):
+            line += f" - <#{r['channel_id']}>"
+        lines.append(line)
     await interaction.response.send_message(embed=em(
         "Position locks" if act else "Idle", "\n".join(lines)[:3900] or "No position lock is running.",
         "ok" if act else "info",
