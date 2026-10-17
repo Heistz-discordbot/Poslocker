@@ -20,8 +20,9 @@ Agent environment (.env next to main.py on the Windows PC)
   (optional) ROBLOX_EXE, MOVE_INTERVAL_MIN, MOVE_MODE, LAUNCH_DELAY, CLOSE_HOST_ROBLOX=1
   alts.json -> [{"name": "alt1", "cookie": "_|WARNING..."}, ...]   (stays on the agent PC only)
 
-Pip:  pip install discord.py requests python-dotenv aiohttp playwright
+Pip:  pip install -U "discord.py>=2.6" requests python-dotenv aiohttp playwright
       python -m playwright install chromium        (needed for /test)
+      (discord.py 2.6+ is required for the new panel layout: Components V2)
 """
 
 import asyncio
@@ -158,9 +159,10 @@ def clean_cookie(c):
 
 
 def load_alts():
-    if not os.path.exists(ALTS_FILE):
+    alts_path = os.path.join(BASE, "alts.json")
+    if not os.path.exists(alts_path):
         return []
-    with open(ALTS_FILE, "r", encoding="utf-8") as f:
+    with open(alts_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     items = data.get("alts", data) if isinstance(data, dict) else data
     alts = []
@@ -1651,39 +1653,48 @@ async def show_roster(interaction):
     await interaction.followup.send(embeds=view.current(), view=view, ephemeral=True)
 
 
-# ================================================================ BOT SIDE: panel
-def panel_embed():
+# ================================================================ BOT SIDE: panel (Components V2 card)
+# One white card: text sections split by divider lines, the Configuration button and the
+# dropdown sit INSIDE the card (same look as the Cruxer panel). Needs discord.py 2.6+.
+def _panel_sep():
+    return discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small)
+
+
+def panel_texts():
     mins = int(MOVE_INTERVAL // 60)
-    e = discord.Embed(color=COLORS["info"])
-    e.description = (
+    intro = (
         "## What is this ❓\n"
-        "- This is the **Position Locker** panel. It sends your alts into the exact Roblox server you are "
-        "standing in, so your spot in that server stays held.\n"
-        "- Simply choose **View Alt Roster** or **Deploy Alts** from the menu below and move further.\n\n"
+        "- This is a **position locker** panel. This is where you can **deploy alts** into the exact Roblox "
+        "server you are standing in, so your spot in that server stays held.\n"
+        "- Simply choose **View Alt Roster** or **Deploy Alts** from the menu below and move further.")
+    benefit = (
         "## What is the benefit of using this?\n"
-        "- Every deployment gets its own **private ticket** with live alt status, move timers and controls.\n"
-        f"- Alts **auto-move every {mins} minutes** to stay active, and crashed clients are relaunched automatically.\n"
-        "- Every session is **logged**, so it can be reviewed or re-opened later.\n\n"
+        "- Every deployment gets its own **private ticket** with live alt status, move timers and controls. "
+        "This bot is made to keep your position safe and make things more organised and easy.\n"
+        f"- Alts **auto-move every {mins} minutes** to stay active, and crashed clients are **relaunched "
+        "automatically**.\n"
+        "- Every session is **logged**, so it can be reviewed or re-opened later.\n"
+        "- **Try it yourself**. You will know it by your own.")
+    rules = (
         "## Rules:\n"
-        "- **Be In-Game First**: join your server before deploying. The alts join the server you are in.\n"
-        "- **Active Profile**: deploy from the Roblox account you linked and are currently using.\n"
-        "- **Joins On**: set who can join you to **Everyone**, otherwise Roblox hides your server.\n"
-        "- **One Lock At A Time**: each member can run one active lock. End it when you are done.\n"
-        "- **No Abuse**: misuse of the alts will result in a blacklist.\n\n"
+        "- **Be In-Game First**: Join your server before deploying. The alts join the server you are in.\n"
+        "- **Active Profile**: Deploy from the Roblox account you linked and are currently using.\n"
+        "- **Joins On**: Set who can join you to **Everyone**, otherwise Roblox hides your server.\n"
+        "- **One Lock At A Time**: Each member can run one active lock. End it when you are done.\n"
+        "- **No Abuse**: Misuse of the alts will result in a blacklist.")
+    config = (
         "## Configuration:\n"
-        "- Link (or unlink) your Roblox username here. Once saved, every deploy uses it automatically. "
-        "Tap the Configuration button again to edit it.\n\n"
-        "## Deploy now:\n"
-        "- Choose **View Alt Roster** or **Deploy Alts** from the menu below.")
-    return e
+        "- Here you can save your Roblox username before making a lock so it will be used automatically for "
+        "every deploy. Once saved you can further Edit Configuration by tapping the Configuration button again.")
+    deploy = (
+        "## Deploy alts now:\n"
+        "- Choose **View Alt Roster** or **Deploy Alts** from the menu below")
+    return intro, benefit, rules, config, deploy
 
 
-class PanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
+class PanelConfigRow(discord.ui.ActionRow):
     @discord.ui.button(label="Configuration", style=discord.ButtonStyle.secondary, custom_id="pos:panel:config")
-    async def config(self, interaction, button):
+    async def config(self, interaction: discord.Interaction, button: discord.ui.Button):
         data = load_links()
         cur = data["linked"].get(str(interaction.user.id))
         txt = (f"You are linked to **[{cur['name']}](https://www.roblox.com/users/{cur['id']}/profile)**."
@@ -1692,13 +1703,15 @@ class PanelView(discord.ui.View):
             embed=em("Configuration", txt + "\n\nUse the buttons below to link a new account or unlink.", "info"),
             view=ConfigView(), ephemeral=True)
 
+
+class PanelMenuRow(discord.ui.ActionRow):
     @discord.ui.select(
         placeholder="Choose Roster or Deploy", custom_id="pos:panel:menu",
         options=[discord.SelectOption(label="View Alt Roster", value="roster", emoji="📋",
                                       description="See every alt, its Roblox profile and whether it is free"),
                  discord.SelectOption(label="Deploy Alts", value="deploy", emoji="🚀",
                                       description="Send alts into the server you are in")])
-    async def menu(self, interaction, select):
+    async def menu(self, interaction: discord.Interaction, select: discord.ui.Select):
         choice = select.values[0]
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
@@ -1711,9 +1724,28 @@ class PanelView(discord.ui.View):
                 await deploy_entry(interaction)
         finally:
             try:
-                await interaction.message.edit(view=self)      # resets the menu selection
+                await interaction.message.edit(view=self.view)      # resets the menu selection
             except Exception:
                 pass
+
+
+class PanelView(discord.ui.LayoutView):
+    def __init__(self):
+        super().__init__(timeout=None)
+        intro, benefit, rules, config, deploy = panel_texts()
+        card = discord.ui.Container()          # no accent colour -> no coloured side bar, like Cruxer
+        card.add_item(discord.ui.TextDisplay(intro))
+        card.add_item(_panel_sep())
+        card.add_item(discord.ui.TextDisplay(benefit))
+        card.add_item(_panel_sep())
+        card.add_item(discord.ui.TextDisplay(rules))
+        card.add_item(_panel_sep())
+        card.add_item(discord.ui.TextDisplay(config))
+        card.add_item(PanelConfigRow())
+        card.add_item(_panel_sep())
+        card.add_item(discord.ui.TextDisplay(deploy))
+        card.add_item(PanelMenuRow())
+        self.add_item(card)
 
 
 async def post_panel(guild, cfg, channel):
@@ -1723,7 +1755,7 @@ async def post_panel(guild, cfg, channel):
             await channel.get_partial_message(old).delete()
         except discord.HTTPException:
             pass
-    m = await channel.send(embed=panel_embed(), view=PanelView())
+    m = await channel.send(view=PanelView())
     cfg["panel_message"] = m.id
     save_db()
 
