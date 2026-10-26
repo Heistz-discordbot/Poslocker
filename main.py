@@ -88,8 +88,16 @@ VERIFY_WORDS = [
     "planet", "quantum", "rocket", "shadow", "tiger", "umbrella", "violet", "wizard"
 ]
 COLORS = {"info": 0x5865F2, "ok": 0x2ECC71, "warn": 0xF1C40F, "err": 0xE74C3C}
-AGENT_OFFLINE = ("The alt agent (the Windows PC that runs the Roblox clients) is offline. "
-                 "Start `py main.py agent` on that PC and try again.")
+AGENT_OFFLINE = (
+    "The alt agent (the Windows PC that runs the Roblox clients) is offline.\n"
+    "On that PC run:\n"
+    "`py main.py agent`\n\n"
+    "Checklist:\n"
+    "• BOT_URL in the agent .env is your live Railway URL (https://…railway.app, no trailing slash)\n"
+    "• AGENT_KEY is identical on the bot and the agent\n"
+    "• The bot is up (open the Railway URL in a browser — you should see “POS Locker bot is running”)\n"
+    "• Windows firewall allows outbound HTTPS from the agent"
+)
 
 IS_WINDOWS = sys.platform == "win32"
 if IS_WINDOWS:
@@ -841,14 +849,26 @@ class Bridge:
 
     @property
     def online(self):
-        return time.time() - self.last_seen < 15
+        # Agent polls every POLL_EVERY (3s). Allow a wider window so one slow/failed
+        # request does not flip the bot to "offline" and block deploy.
+        return self.last_seen > 0 and (time.time() - self.last_seen) < 45
 
     def send(self, type_, **payload):
         self.commands.append({"id": uuid.uuid4().hex, "type": type_, **payload})
 
     async def call(self, type_, timeout=60, **payload):
         if not self.online:
-            raise AgentError(AGENT_OFFLINE, "offline")
+            # Brief wait in case the agent is mid-poll (avoids false offline right after bot restart)
+            for _ in range(6):
+                await asyncio.sleep(0.5)
+                if self.online:
+                    break
+            if not self.online:
+                age = int(time.time() - self.last_seen) if self.last_seen else None
+                extra = (f"\n\n(Last agent contact: never — agent has not connected since this bot started.)"
+                         if age is None else
+                         f"\n\n(Last agent contact: {age}s ago.)")
+                raise AgentError(AGENT_OFFLINE + extra, "offline")
         cid = uuid.uuid4().hex
         fut = asyncio.get_running_loop().create_future()
         self.futures[cid] = fut
@@ -856,7 +876,11 @@ class Bridge:
         try:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
-            raise AgentError("The agent PC did not answer in time.", "timeout")
+            raise AgentError(
+                "The agent PC did not answer in time. "
+                "It is connected but busy or stuck — check the agent console on the Windows PC.",
+                "timeout",
+            )
         finally:
             self.futures.pop(cid, None)
 
@@ -871,7 +895,21 @@ class Bridge:
 
 
 bridge = Bridge()
-PENDING = set()      # ticket ids being deployed right now (so reconcile does not kill them)
+PENDING = set()
+
+async def ensure_agent_online(wait_s: float = 3.0) -> bool:
+    """True if the agent has polled recently. Waits briefly for a mid-flight poll."""
+    if bridge.online:
+        return True
+    steps = max(1, int(wait_s / 0.5))
+    for _ in range(steps):
+        await asyncio.sleep(0.5)
+        if bridge.online:
+            return True
+    return False
+
+
+      # ticket ids being deployed right now (so reconcile does not kill them)
 
 
 # ================================================================ BOT SIDE: data helpers
@@ -1413,7 +1451,7 @@ async def deploy_entry(interaction, edit=False):
             "Link your Roblox account first",
             "Tap **Link Account**, verify your profile, then press **Retry Join Check**.", "warn"),
             JoinNoticeView(), edit)
-    if not bridge.online:
+    if not await ensure_agent_online():
         return await reply(interaction, em("Agent offline", AGENT_OFFLINE, "err"), None, edit)
     try:
         await bridge.call("locate", timeout=120, user_id=linked["id"], name=linked["name"])
@@ -1520,7 +1558,7 @@ async def deploy_flow(interaction, names, reopen=None):
     if not cfg or not cfg.get("authorized"):
         return await fail("Not authorized", "The developer has not run /authorize in this server yet.")
     owner_id = reopen["owner_id"] if reopen else interaction.user.id
-    if not bridge.online:
+    if not await ensure_agent_online():
         return await fail("Agent offline", AGENT_OFFLINE)
     for r in active_tickets():
         if r["owner_id"] == owner_id and (not reopen or r["id"] != reopen["id"]):
@@ -1648,7 +1686,7 @@ class RosterView(discord.ui.View):
 
 
 async def show_roster(interaction):
-    if not bridge.online:
+    if not await ensure_agent_online():
         return await reply(interaction, em("Agent offline", AGENT_OFFLINE, "err"))
     alts = bridge.alts
     if not alts:
